@@ -131,11 +131,16 @@
         "type": "bool",
         "default": false
       },
-      "send_as_record": {
-        "description": "用语音组件发送",
-        "hint": "true=Record 组件（QQ/微信适配更好，私聊 30MB 内 FLAC 可正常发）；false=File 组件（部分平台兼容性差）",
-        "type": "bool",
-        "default": true
+      "output_mode": {
+        "description": "消息输出方式",
+        "hint": "link=文本+封面+直链（最稳，文件大的也能看到）;audio=文本+封面+音频文件（需下载，FLAC 私聊可能发不出）;video=只发合成视频气泡（封面+音频合一，视频尺寸=封面原尺寸 1fps）",
+        "type": "string",
+        "options": [
+          "link",
+          "audio",
+          "video"
+        ],
+        "default": "video"
       },
       "show_cover": {
         "description": "附带专辑封面",
