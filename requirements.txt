@@ -1,0 +1,19 @@
+# 插件自身
+aiohttp>=3.9.0
+
+# 内置 vendor/netease_url 解析依赖（音乐 API 加密/网络）
+requests>=2.28.0
+cryptography>=40.0.0
+
+# 内置 vendor/tencent_url 解析依赖
+requests>=2.28.0
+
+# v0.3.7.5 可选：合成 封面+音频 视频文件（QQ 视频气泡每一帧都是封面）
+# 推荐装这个 Python 嵌入版 ffmpeg，不需系统依赖：
+# imageio-ffmpeg>=0.4.9
+# 装了之后会自动启用。没有也能跑，会降级为发原始音频文件。
+
+# 备注：vendor/netease_url 还可选 qrcode/Pillow/cryptography 用于扫码登录
+# 默认 Cookie 模式用不到，按需开启：
+# qrcode>=7.4
+# Pillow>=9.0

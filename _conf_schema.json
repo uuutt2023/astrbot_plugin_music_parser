@@ -1,0 +1,211 @@
+{
+  "cookies": {
+    "description": "会员 Cookie 配置",
+    "hint": "VIP/高音质必备。登录网页版 → F12 → Network → 任意请求 → 复制 Cookie 字段。普通 Cookie 只能解析标准音质。",
+    "items": {
+      "netease_cookie": {
+        "description": "网易云 Cookie",
+        "hint": "黑胶 VIP Cookie（Music_U 等）。黑胶可解 lossless/hires，SVIP 可解 sky/jymaster。",
+        "type": "string",
+        "default": ""
+      },
+      "tencent_cookie": {
+        "description": "QQ 音乐 Cookie",
+        "hint": "QQ 音乐会员 Cookie（uin/qm_keyst 等）。flac/ape/master 需绿钻/豪华绿钻。",
+        "type": "string",
+        "default": ""
+      }
+    },
+    "type": "object"
+  },
+  "parsers": {
+    "description": "平台开关与输出模式",
+    "hint": "关闭=不解析；仅文本=不发音频/封面；仅音频=只发音频不发文本；全部=文本+封面+音频",
+    "items": {
+      "netease": {
+        "description": "网易云音乐",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅音频"
+        ],
+        "default": "全部发送"
+      },
+      "tencent": {
+        "description": "QQ 音乐",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅音频"
+        ],
+        "default": "全部发送"
+      }
+    },
+    "type": "object"
+  },
+  "quality": {
+    "description": "默认音质选择",
+    "hint": "高音质（lossless/hires/ape/master）需要对应平台会员 Cookie。Cookie 不够时会自动降级到 standard/128。",
+    "items": {
+      "netease_level": {
+        "description": "网易云默认音质",
+        "hint": "standard=标准 / exhigh=极高 / lossless=无损 / hires=高清无损 / jyeffect=鲸云音效 / sky=沉浸环绕声 / jymaster=超清母带（后两个需 SVIP）",
+        "type": "string",
+        "options": [
+          "standard",
+          "exhigh",
+          "lossless",
+          "hires",
+          "jyeffect",
+          "sky",
+          "jymaster"
+        ],
+        "default": "lossless"
+      },
+      "tencent_level": {
+        "description": "QQ 音乐默认音质",
+        "hint": "128=标准 / 320=高品质 / flac=无损 / ape=无损压缩 / master=母带 / atmos_2=二维全景声 / atmos_51=5.1 声道（ape/master/atmos 需豪华绿钻）",
+        "type": "string",
+        "options": [
+          "128",
+          "320",
+          "flac",
+          "ape",
+          "master",
+          "atmos_2",
+          "atmos_51"
+        ],
+        "default": "flac"
+      }
+    },
+    "type": "object"
+  },
+  "trigger": {
+    "description": "触发方式",
+    "hint": "auto_parse 自动解析消息中的音乐链接；reply_trigger 引用消息 + 关键词触发；keywords 是手动关键词（自动关闭时仍生效）",
+    "items": {
+      "auto_parse": {
+        "description": "自动解析链接",
+        "type": "bool",
+        "default": true
+      },
+      "reply_trigger": {
+        "description": "回复消息触发",
+        "type": "bool",
+        "default": true
+      },
+      "keywords": {
+        "description": "手动触发关键词",
+        "type": "list",
+        "default": [
+          "解析音乐",
+          "音乐解析",
+          "解析",
+          "来一份"
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "message": {
+    "description": "消息展示",
+    "hint": "show_lyric 会附带前 30 行歌词；send_as_record=true 用语音组件发送（QQ/微信适配更好但不支持封面+歌词组合）",
+    "items": {
+      "opening_enabled": {
+        "description": "发送开场语",
+        "type": "bool",
+        "default": true
+      },
+      "opening_content": {
+        "description": "开场语内容",
+        "type": "string",
+        "default": "🎵 音乐解析小助手为您服务～"
+      },
+      "show_lyric": {
+        "description": "附带歌词",
+        "hint": "附带前 30 行歌词，文本消息比较长。",
+        "type": "bool",
+        "default": false
+      },
+      "send_as_record": {
+        "description": "用语音组件发送",
+        "hint": "true=Record 组件（QQ/微信适配更好，私聊 30MB 内 FLAC 可正常发）；false=File 组件（部分平台兼容性差）",
+        "type": "bool",
+        "default": true
+      },
+      "show_cover": {
+        "description": "附带专辑封面",
+        "type": "bool",
+        "default": true
+      }
+    },
+    "type": "object"
+  },
+  "permission": {
+    "description": "权限控制",
+    "hint": "enabled_groups 为空=所有群可用；admin_id 用于私聊的清理缓存等管理员命令",
+    "items": {
+      "private_enabled": {
+        "description": "允许私聊使用",
+        "type": "bool",
+        "default": true
+      },
+      "group_enabled": {
+        "description": "允许群聊使用",
+        "type": "bool",
+        "default": true
+      },
+      "enabled_groups": {
+        "description": "白名单群号",
+        "hint": "留空=所有群都可用；填群号=只有这些群能用（多个用逗号或回车分隔）",
+        "type": "list",
+        "default": []
+      },
+      "admin_id": {
+        "description": "管理员 ID",
+        "type": "string",
+        "default": ""
+      }
+    },
+    "type": "object"
+  },
+  "cache": {
+    "description": "媒体缓存",
+    "hint": "QQ 等平台直链发送容易被风控，建议开启本地缓存。cleanup_after 是发送后多少秒自动清理文件（释放磁盘）",
+    "items": {
+      "enable_cache": {
+        "description": "启用本地缓存",
+        "hint": "QQ/微信直链发送可能被风控限速，开启后用本地路径发更稳",
+        "type": "bool",
+        "default": true
+      },
+      "cache_dir": {
+        "description": "缓存目录",
+        "hint": "留空=用 AstrBot 插件数据目录下的 music_cache/。可填绝对路径如 /data/music_cache",
+        "type": "string",
+        "default": ""
+      },
+      "cleanup_after": {
+        "description": "发送后清理延时（秒）",
+        "type": "int",
+        "default": 600
+      }
+    },
+    "type": "object"
+  },
+  "debug": {
+    "description": "调试",
+    "items": {
+      "verbose_log": {
+        "description": "输出详细日志",
+        "type": "bool",
+        "default": false
+      }
+    },
+    "type": "object"
+  }
+}

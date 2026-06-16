@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env/
+
+# 敏感信息（用户的 Cookie 不要提交）
+# 注意：cookie.txt.example 是占位文件，可以提交；真实 cookie 不应提交
+netease_cookie.txt
+tencent_cookie.txt
+*_cookie.txt
+*.cookie
+
+# 媒体缓存
+music_cache/
+cache/
+*.mp3
+*.flac
+*.m4a
+*.ape
+*.ogg
+downloads/
+
+# 后端日志（运行时产生）
+backend_logs/
+*.log
+logs/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 系统
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.zip
+!vendor/**/*.zip
