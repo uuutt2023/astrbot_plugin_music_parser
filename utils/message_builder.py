@@ -211,15 +211,19 @@ def build_song_chain(
     as_record: bool = True,
     local_audio_path: Optional[Path] = None,
     synth_video_path: Optional[Path] = None,
+    output_mode: str = "video",
 ) -> list:
     """把 SongMetadata 渲染成 AstrBot 消息组件列表。
+
+    v0.3.9：新增 output_mode 三选一:
+      - "link":  文本 + 封面 + 直链 (Plain + Image + Plain URL) — 最稳，文件大也能看
+      - "audio": 文本 + 封面 + 音频文件 (Plain + Image + Record/File/Video) — 需要下载发送
+      - "video": 只发合成视频气泡 (Video only) — 封面+音频合一，无需额外文本/封面
 
     v0.3.7.5：接受 synth_video_path 参数（提前合成的封面+音频 视频文件）。
               传入后会优先使用合成视频，QQ 视频气泡每一帧都是封面。
     v0.3.7.4：Video 组件自带画面（QQ 视频气泡 = 封面 + 音频二合一），
-    与额外发 Image 封面是重复的——会发两次图。智能检测：
-    - audio_component 返回 Video -> 跳过 Image 封面
-    - audio_component 返回 Record/File -> 正常发 Image 封面
+    与额外发 Image 封面是重复的——会发两次图。
     """
     if not _HAVE_ASTRBOT:
         return [meta]
@@ -229,38 +233,62 @@ def build_song_chain(
     if not meta.ok:
         return build_error_chain(meta)
 
-    if show_text:
-        artists = " / ".join(meta.artists) if meta.artists else "未知艺术家"
-        text = f"🎵 {meta.name} - {artists}"
-        if meta.album:
-            text += f"\n💿 {meta.album}"
-        if meta.bitrate:
-            text += f"\n🎚 音质：{meta.bitrate}"
-        chain.append(Plain(text))
+    # 模式归一化
+    mode = (output_mode or "video").lower().strip()
+    if mode not in ("link", "audio", "video"):
+        mode = "video"
 
-    if show_audio and meta.audio_url:
-        node = _audio_component(meta, local_audio_path, as_record, synth_video_path)
-        if node is not None:
-            chain.append(node)
-            is_video = _is_video_node(node)
-            if show_cover and meta.pic_url and not is_video:
-                try:
-                    chain.append(Image.fromURL(meta.pic_url))
-                except Exception:
-                    chain.append(Plain(f"🖼 封面：{meta.pic_url}"))
-            elif show_cover and meta.pic_url and is_video:
-                _log_i(
-                    "[chain.build] audio 是 Video 组件（QQ 视频气泡），跳过 Image 封面"
-                )
-    else:
+    # === 模式 video: 只发合成视频气泡 ===
+    if mode == "video":
+        if synth_video_path and synth_video_path.exists() and Video is not None:
+            try:
+                if hasattr(Video, "fromFileSystem"):
+                    chain.append(Video.fromFileSystem(str(synth_video_path)))
+                elif hasattr(Video, "fromFile"):
+                    chain.append(Video.fromFile(str(synth_video_path)))
+                else:
+                    chain.append(File(file=str(synth_video_path), name=synth_video_path.name))
+                _log_i(f"[chain.build] mode=video 只发合成视频气泡: {synth_video_path}")
+                return chain
+            except Exception as exc:  # noqa: BLE001
+                _log_w(f"[chain.build] 合成视频构造失败: {type(exc).__name__}: {exc}")
+        # 合成视频不可用 -> 降级到 audio 模式
+        _log_w("[chain.build] mode=video 但合成视频不可用，降级到 audio")
+        mode = "audio"
+
+    # === 模式 link / audio 共用前置：Plain 文本 + Image 封面 ===
+    if mode in ("link", "audio"):
+        if show_text:
+            artists = " / ".join(meta.artists) if meta.artists else "未知艺术家"
+            text = f"🎵 {meta.name} - {artists}"
+            if meta.album:
+                text += f"\n💿 {meta.album}"
+            if meta.bitrate:
+                text += f"\n🎚 音质：{meta.bitrate}"
+            chain.append(Plain(text))
+
         if show_cover and meta.pic_url:
             try:
                 chain.append(Image.fromURL(meta.pic_url))
             except Exception:
                 chain.append(Plain(f"🖼 封面：{meta.pic_url}"))
 
-    if show_lyric and meta.lyric:
-        chain.append(Plain(_truncate_lyric(meta.lyric)))
+        if mode == "link":
+            # 只发文本+封面+直链，不下载不发音频
+            if meta.audio_url:
+                chain.append(Plain(f"🔗 音频直链：{meta.audio_url}"))
+            if show_lyric and meta.lyric:
+                chain.append(Plain(_truncate_lyric(meta.lyric)))
+            return chain
+
+        # mode == "audio": 发音频文件
+        if show_audio and meta.audio_url:
+            node = _audio_component(meta, local_audio_path, as_record, synth_video_path)
+            if node is not None:
+                chain.append(node)
+
+        if show_lyric and meta.lyric:
+            chain.append(Plain(_truncate_lyric(meta.lyric)))
 
     return chain
 
