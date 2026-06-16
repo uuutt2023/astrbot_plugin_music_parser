@@ -234,14 +234,43 @@ class MusicParserPlugin(Star):
         show_audio = cfg.parsers.has_audio(meta.source)
         show_cover = show_text and cfg.message.show_cover
         show_lyric = show_text and cfg.message.show_lyric
+
+        # v0.3.9: 用户三选一输出模式 (link / audio / video)
+        # - link:  文本+封面+直链 (不下载不发文件)
+        # - audio: 文本+封面+音频文件 (下载发送原音频)
+        # - video: 只发合成视频气泡 (下载后合成 封面+音频，视频尺寸=封面原尺寸 1fps)
+        output_mode = getattr(cfg.message, "output_mode", "video") or "video"
+        output_mode = str(output_mode).lower().strip()
+        if output_mode not in ("link", "audio", "video"):
+            output_mode = "video"
+        # send_as_record 是旧的布尔开关，与 output_mode 互动：
+        #   output_mode == "video": 不需要 Record（Video 组件自带音视频）
+        #   output_mode == "audio": send_as_record=true 用 Record；false 用 Video/File
+        #   output_mode == "link":  不需要音频组件
+        send_as_record = bool(getattr(cfg.message, "send_as_record", True))
+        # video 模式强制不用 Record
+        if output_mode == "video":
+            send_as_record = False
+
         d(
             f"[send_one] 输出模式: text={show_text} audio={show_audio} "
-            f"cover={show_cover} lyric={show_lyric}"
+            f"cover={show_cover} lyric={show_lyric} output_mode={output_mode} "
+            f"send_as_record={send_as_record}"
         )
 
-        # 6) 下载
+        # 6) 下载（按 output_mode 决定）
         local_path = None
-        if show_audio and cfg.cache.enable_cache and self.download_manager:
+        need_download = (
+            cfg.cache.enable_cache
+            and self.download_manager
+            and meta.audio_url
+            and (
+                (output_mode == "audio" and show_audio)
+                or (output_mode == "video")
+                # link 模式不需要下载
+            )
+        )
+        if need_download:
             res = await self.download_manager.download(
                 url=meta.audio_url,
                 filename=self._audio_filename(meta),
@@ -250,15 +279,18 @@ class MusicParserPlugin(Star):
                 local_path = res.path
                 d(f"[send_one] 音频已下载到本地: {local_path}")
         else:
-            d(f"[send_one] 跳过本地下载 (audio={show_audio} cache={cfg.cache.enable_cache})")
+            d(
+                f"[send_one] 跳过本地下载 "
+                f"(output_mode={output_mode} show_audio={show_audio} cache={cfg.cache.enable_cache})"
+            )
 
-        # 6.5) v0.3.7.5: 合成 封面+音频 视频（让 QQ 视频气泡每一帧都是封面）
+        # 6.5) v0.3.7.5: 合成 封面+音频 视频（video 模式必须，其它模式也可用）
         synth_video_path = None
         if (
             local_path
             and local_path.exists()
-            and not cfg.message.send_as_record
             and meta.pic_url
+            and output_mode in ("video", "audio")  # audio 模式优先用合成视频
         ):
             try:
                 from .core.video_synthesizer import synthesize_to_temp
@@ -285,9 +317,10 @@ class MusicParserPlugin(Star):
             show_cover=show_cover,
             show_audio=show_audio,
             show_lyric=show_lyric,
-            as_record=cfg.message.send_as_record,
+            as_record=send_as_record,
             local_audio_path=local_path,
             synth_video_path=synth_video_path,
+            output_mode=output_mode,
         )
         d(f"[send_one] 消息链长度={len(chain)}")
         # 打印每个 component 的类型和关键字段，方便排查
