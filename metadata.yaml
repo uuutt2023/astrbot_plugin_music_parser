@@ -1,5 +1,5 @@
 name: astrbot_plugin_music_parser
 desc: 开箱即用的网易云 / QQ 音乐解析插件（进程内调用，零子进程）
-version: 0.3.0
+version: 0.3.8
 author: uuutt2023
 repo: https://github.com/uuutt2023/astrbot_plugin_music_parser
