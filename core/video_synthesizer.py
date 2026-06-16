@@ -107,24 +107,47 @@ def _extract_embedded_cover(audio_path: Path, target: Path) -> bool:
         return False
 
 
+def _probe_cover_size(cover_path: Path) -> Tuple[int, int]:
+    """探测封面图原始尺寸 (w, h)。失败返回 (1920, 1080) 默认值。"""
+    try:
+        from PIL import Image
+
+        with Image.open(cover_path) as img:
+            w, h = img.size
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    # 备选：ffprobe
+    try:
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            str(cover_path),
+        ]
+        out = subprocess.check_output(
+            probe_cmd, stderr=subprocess.STDOUT, timeout=10
+        ).decode().strip()
+        w, h = out.split("x")
+        return int(w), int(h)
+    except Exception:
+        return 1920, 1080
+
+
 def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> bool:
-    """同步 ffmpeg 合成。封面作为画面（循环），音频保留原始质量。"""
+    """同步 ffmpeg 合成。封面作为画面（循环），音频保留原始质量。
+
+    v0.3.9：视频尺寸按封面原尺寸（用户要求）；帧率 1fps（静态图片够用）。
+    """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return False
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # 命令行参数：
-        # -framerate 2 -loop 1: 图片循环作为 2fps 视频帧
-        # -i cover: 输入图
-        # -i audio: 输入音频
-        # -c:v libx264 -tune stillimage: 针对静态图优化的编码
-        # -c:a aac -b:a 256k: 音频转 AAC 256k（QQ 视频气泡兼容性最好）
-        #   也可以用 -c:a copy 保留原始 FLAC，但部分播放器不支持
-        # -t 5: 用音频时长作为视频时长（不依赖 -shortest，因为 -vf 后行为不一致）
-        # -pix_fmt yuv420p: 兼容性
-        # -vf scale=1920:1080: 标准化到 1080p 16:9（QQ 视频气泡默认尺寸）
-        # 先探测音频时长
+        # 先探测音频时长 + 封面尺寸
         try:
             probe_cmd = [
                 "ffprobe",
@@ -138,11 +161,32 @@ def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> 
             ).decode().strip()
             duration_sec = float(duration_str)
         except Exception:
-            duration_sec = 0  # 探测失败时不限时长
+            duration_sec = 0
+
+        # 探测封面尺寸，让视频尺寸 = 封面原尺寸
+        cover_w, cover_h = _probe_cover_size(cover_path)
+        # h264 编码要求宽高是偶数
+        if cover_w % 2 != 0:
+            cover_w += 1
+        if cover_h % 2 != 0:
+            cover_h += 1
+        _log_i(
+            f"[video_synth] 视频尺寸 = 封面原尺寸 {cover_w}x{cover_h}, fps=1"
+        )
+
+        # 命令行参数：
+        # -r 1 -loop 1: 1fps（静态图够用，文件最小）
+        # -i cover: 输入图
+        # -i audio: 输入音频
+        # -c:v libx264 -tune stillimage: 针对静态图优化的编码
+        # -c:a aac -b:a 256k: 音频转 AAC 256k（QQ 视频气泡兼容性最好）
+        # -t <duration>: 用音频时长
+        # -pix_fmt yuv420p: 兼容性
+        # -vf scale=W:H: 保持封面原尺寸，不强制 1080p
         cmd = [
             ffmpeg,
             "-y",
-            "-framerate", "2",
+            "-r", "1",
             "-loop", "1",
             "-i", str(cover_path),
             "-i", str(audio_path),
@@ -153,7 +197,7 @@ def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> 
             "-c:a", "aac",
             "-b:a", "256k",
             "-pix_fmt", "yuv420p",
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
+            "-vf", f"scale={cover_w}:{cover_h}:force_original_aspect_ratio=decrease,pad={cover_w}:{cover_h}:(ow-iw)/2:(oh-ih)/2:black",
         ]
         if duration_sec > 0:
             cmd.extend(["-t", str(duration_sec)])
