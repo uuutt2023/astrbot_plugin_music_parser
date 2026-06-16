@@ -298,6 +298,9 @@ class MusicParserPlugin(Star):
                 synth_video_path = await synthesize_to_temp(
                     audio_path=local_path,
                     cover_url=meta.pic_url,
+                    fps=int(getattr(cfg.message, "video_fps", 2) or 2),
+                    max_width=int(getattr(cfg.message, "video_max_width", 1920) or 1920),
+                    max_height=int(getattr(cfg.message, "video_max_height", 1080) or 1080),
                 )
                 if synth_video_path:
                     d(

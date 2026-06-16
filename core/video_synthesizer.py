@@ -118,7 +118,6 @@ def _probe_cover_size(cover_path: Path) -> Tuple[int, int]:
             return w, h
     except Exception:
         pass
-    # 备选：ffprobe
     try:
         probe_cmd = [
             "ffprobe",
@@ -137,17 +136,57 @@ def _probe_cover_size(cover_path: Path) -> Tuple[int, int]:
         return 1920, 1080
 
 
-def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> bool:
+def _calc_video_size(
+    cover_w: int, cover_h: int, max_w: int = 1920, max_h: int = 1080
+) -> Tuple[int, int]:
+    """按封面原比例缩放到 max_w x max_h 范围内（不裁切，居中黑边）。
+    原图小于上限时不放大（保持原图尺寸，避免画质损失）。
+
+    例子（max 1920x1080）:
+      封面 4000x4000 (1:1) -> 视频 1080x1080
+      封面 1920x1080 (16:9) -> 视频 1920x1080
+      封面 1080x1920 (9:16) -> 视频 608x1080（等比缩放，高度受限）
+      封面 4000x2250 (16:9) -> 视频 1920x1080
+      封面 1000x1000 -> 视频 1000x1000（小于上限，不放大）
+    """
+    if cover_w <= 0 or cover_h <= 0:
+        return max_w, max_h
+    # 计算等比缩放系数，但不放大（scale <= 1）
+    scale = min(max_w / cover_w, max_h / cover_h, 1.0)
+    new_w = int(cover_w * scale)
+    new_h = int(cover_h * scale)
+    # h264 要求宽高偶数
+    if new_w % 2 != 0:
+        new_w += 1
+    if new_h % 2 != 0:
+        new_h += 1
+    if new_w < 16:
+        new_w = 16
+    if new_h < 16:
+        new_h = 16
+    return new_w, new_h
+
+
+def _run_ffmpeg_synth(
+    audio_path: Path,
+    cover_path: Path,
+    output_path: Path,
+    *,
+    fps: int = 2,
+    max_width: int = 1920,
+    max_height: int = 1080,
+) -> bool:
     """同步 ffmpeg 合成。封面作为画面（循环），音频保留原始质量。
 
-    v0.3.9：视频尺寸按封面原尺寸（用户要求）；帧率 1fps（静态图片够用）。
+    v0.3.10: 视频尺寸 = max(1920)xmax(1080) 上限，按封面比例缩放，居中黑边。
+              帧数 fps 可配（默认 2）。
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return False
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # 先探测音频时长 + 封面尺寸
+        # 探测音频时长
         try:
             probe_cmd = [
                 "ffprobe",
@@ -163,30 +202,31 @@ def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> 
         except Exception:
             duration_sec = 0
 
-        # 探测封面尺寸，让视频尺寸 = 封面原尺寸
+        # 按封面比例计算视频尺寸（不超出 max_width x max_height）
         cover_w, cover_h = _probe_cover_size(cover_path)
-        # h264 编码要求宽高是偶数
-        if cover_w % 2 != 0:
-            cover_w += 1
-        if cover_h % 2 != 0:
-            cover_h += 1
+        target_w, target_h = _calc_video_size(
+            cover_w, cover_h, max_width, max_height
+        )
+        # fps 安全值
+        fps = max(1, min(int(fps), 30))
         _log_i(
-            f"[video_synth] 视频尺寸 = 封面原尺寸 {cover_w}x{cover_h}, fps=1"
+            f"[video_synth] 封面原尺寸 {cover_w}x{cover_h} -> "
+            f"视频尺寸 {target_w}x{target_h} (max {max_width}x{max_height}, fps={fps})"
         )
 
         # 命令行参数：
-        # -r 1 -loop 1: 1fps（静态图够用，文件最小）
+        # -r <fps> -loop 1: 循环图片作为视频帧
         # -i cover: 输入图
         # -i audio: 输入音频
         # -c:v libx264 -tune stillimage: 针对静态图优化的编码
         # -c:a aac -b:a 256k: 音频转 AAC 256k（QQ 视频气泡兼容性最好）
         # -t <duration>: 用音频时长
         # -pix_fmt yuv420p: 兼容性
-        # -vf scale=W:H: 保持封面原尺寸，不强制 1080p
+        # -vf scale=W:H:force_original_aspect_ratio=decrease: 等比缩放，不裁切，居中黑边
         cmd = [
             ffmpeg,
             "-y",
-            "-r", "1",
+            "-r", str(fps),
             "-loop", "1",
             "-i", str(cover_path),
             "-i", str(audio_path),
@@ -197,7 +237,9 @@ def _run_ffmpeg_synth(audio_path: Path, cover_path: Path, output_path: Path) -> 
             "-c:a", "aac",
             "-b:a", "256k",
             "-pix_fmt", "yuv420p",
-            "-vf", f"scale={cover_w}:{cover_h}:force_original_aspect_ratio=decrease,pad={cover_w}:{cover_h}:(ow-iw)/2:(oh-ih)/2:black",
+            "-vf",
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black",
         ]
         if duration_sec > 0:
             cmd.extend(["-t", str(duration_sec)])
@@ -228,6 +270,9 @@ async def synthesize_cover_audio_video(
     audio_path: Path,
     cover_url: Optional[str],
     output_path: Path,
+    fps: int = 2,
+    max_width: int = 1920,
+    max_height: int = 1080,
 ) -> Tuple[bool, str]:
     """合成 封面+音频 的 mp4 视频。返回 (成功, 备注)。"""
     ffmpeg = find_ffmpeg()
@@ -275,9 +320,18 @@ async def synthesize_cover_audio_video(
 
     # 2) ffmpeg 合成（丢到线程池避免阻塞 event loop）
     loop = asyncio.get_event_loop()
-    synth_ok = await loop.run_in_executor(
-        None, _run_ffmpeg_synth, audio_path, cover_path, output_path
-    )
+
+    def _synth_call():
+        return _run_ffmpeg_synth(
+            audio_path,
+            cover_path,
+            output_path,
+            fps=fps,
+            max_width=max_width,
+            max_height=max_height,
+        )
+
+    synth_ok = await loop.run_in_executor(None, _synth_call)
 
     # 清理临时封面
     try:
@@ -305,6 +359,9 @@ async def synthesize_to_temp(
     *,
     audio_path: Path,
     cover_url: Optional[str],
+    fps: int = 2,
+    max_width: int = 1920,
+    max_height: int = 1080,
 ) -> Optional[Path]:
     """合成视频到 audio 同目录的临时文件，返回合成后的路径。失败返回 None。"""
     output_path = audio_path.with_suffix(".cover.mp4")
@@ -321,5 +378,8 @@ async def synthesize_to_temp(
         audio_path=audio_path,
         cover_url=cover_url,
         output_path=output_path,
+        fps=fps,
+        max_width=max_width,
+        max_height=max_height,
     )
     return output_path if ok else None

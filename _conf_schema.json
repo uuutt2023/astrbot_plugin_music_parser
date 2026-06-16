@@ -146,6 +146,24 @@
         "description": "附带专辑封面",
         "type": "bool",
         "default": true
+      },
+      "video_fps": {
+        "description": "视频帧数",
+        "hint": "合成视频的帧数（静态画面，1-2 fps 足够，默认 2）",
+        "type": "int",
+        "default": 2
+      },
+      "video_max_width": {
+        "description": "视频最大宽度",
+        "hint": "视频宽度上限（按封面比例缩放，不裁切，居中黑边）",
+        "type": "int",
+        "default": 1920
+      },
+      "video_max_height": {
+        "description": "视频最大高度",
+        "hint": "视频高度上限（按封面比例缩放）",
+        "type": "int",
+        "default": 1080
       }
     },
     "type": "object"
