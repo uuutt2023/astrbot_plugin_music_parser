@@ -51,6 +51,31 @@ def _truncate_lyric(lyric: str | None, max_lines: int = 30) -> str:
     return "\n".join(lines[:max_lines]) + "\n…（歌词已截断）"
 
 
+def chain_node_summary(node) -> str:
+    """提取 message component 的关键字段为摘要字符串。
+
+    避免 main.py 里用 hasattr + getattr 反射获取字段（重复多次调用且容易出错）。
+    """
+    if node is None:
+        return "<None>"
+    cls = type(node).__name__
+    fields = []
+    text = getattr(node, "text", None)
+    if isinstance(text, str) and text:
+        fields.append(f"text={text[:60]!r}")
+    url = getattr(node, "url", None)
+    if url:
+        fields.append(f"url={str(url)[:80]!r}")
+    file_attr = getattr(node, "file", None)
+    if file_attr:
+        fields.append(f"file={str(file_attr)[:80]!r}")
+    path_or_url = getattr(node, "path_or_url", None)
+    if path_or_url and not file_attr:
+        fields.append(f"file/path={str(path_or_url)[:80]!r}")
+    detail = " " + " ".join(fields) if fields else ""
+    return f"{cls}{detail}"
+
+
 def _audio_filename(meta: SongMetadata) -> str:
     safe_name = (meta.name or "audio").strip().replace("/", "_").replace("\\", "_")[:60]
     artists = "-".join(meta.artists) if meta.artists else "未知"
