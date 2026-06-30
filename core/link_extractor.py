@@ -30,7 +30,9 @@ NETEASE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"https?://music\.163\.com/program\?id=(\d+)"),
     re.compile(r"https?://y\.music\.163\.com/m/song\?id=(\d+)"),
     re.compile(r"https?://163cn\.tv/[A-Za-z0-9]+"),
-    re.compile(r"(?<![A-Za-z0-9])(\d{6,20})(?![A-Za-z0-9])"),
+    # 注意：v0.3.12 移除纯数字正则 (?<![A-Za-z0-9])(\d{6,20})(?![A-Za-z0-9])
+    # 原因：会把 Pixiv / B站 / 其他 URL 中的 ID 误识别为网易云歌曲 ID
+    # 用户需要纯数字网易云 ID 时，请用命令「网易云 <ID>」
 )
 
 # ──────────── QQ 音乐 ────────────
