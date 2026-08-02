@@ -45,19 +45,34 @@ WebUI → 音乐解析插件 → 配置：
 
 `message.output_mode` 字段选一种：
 
-| 值 | 发什么 |
-|----|--------|
-| `video`（默认） | 合成视频气泡，封面+音频合一 |
-| `audio` | 文本+封面+音频文件 |
-| `link` | 文本+封面+直链，不下载音频 |
+| 值 | 发什么 | 稳定性 |
+|----|--------|--------|
+| `audio`（默认 v0.3.13+） | 文本+封面+音频文件 | ★★★ 稳，QQ 兼容最好 |
+| `video` | 合成视频气泡，封面+音频合一 | ★★ 体验最好但容易踩 retcode=100 `fetch failed`，失败会自动降级到 `audio` 模式 |
+| `link` | 文本+封面+直链，不下载音频 | ★★★ 最稳，但用户需自己点链接收听 |
 
 视频气泡的封面比例自适应，帧数和视频上限可在 `video_fps`、`video_max_width`、`video_max_height` 调。
+
+> **v0.3.13 默认值变更**：默认从 `video` 改为 `audio`。`video` 模式在 aiocqhttp + napcat 链路下经常触发 `retcode=100, wording='fetch failed'`（Video 节点上传阶段 fetch 本地 `file://` URI 失败）。如果你用 `video` 模式，v0.3.13 已加上自动降级：视频发送失败时降级到 `audio` 模式（Plain+Image+Record）重发一次，至少能保证用户听到声音。如果你不想用 video，直接在 WebUI 改回 `audio` 即可。
 
 ## 故障排查
 
 ### 大文件不发送
 
 QQ 平台对音频文件大小有限制。`message.output_mode` 切到 `link` 看直链，或用 `audio` 模式发小一点的音质。
+
+### 视频模式 `retcode=100, fetch failed`
+
+这是 **video 输出模式** 在 aiocqhttp + napcat 链路下的已知问题：插件合成 mp4 后用 `Video` 节点上传，napcat 拿到 `file:///...` 本地路径后去 fetch，但 file:// 协议在 fetch 阶段经常失败。
+
+v0.3.13 已修复：
+1. **video 模式构造 Video 节点改用裸绝对路径**（不再自动拼 `file://` URI），部分 napcat 版本能识别
+2. **video 发送失败时自动降级到 audio 模式**（Plain+Image+Record 重发），用户至少能听到音频
+3. **默认 output_mode 改为 `audio`**，降低默认踩坑概率
+
+如果仍然想用 video 模式又稳定发不出，请确认：
+- napcat 版本是最新（`fetch failed` 修复在 napcat 较新版本里）
+- 或者切到 `audio` / `link` 模式
 
 ### 日志里没 `[music_parser]` 字样
 
@@ -107,7 +122,7 @@ WebUI 可视化配置，schema 在 `_conf_schema.json`。常用字段：
 | quality | tencent_level | flac | QQ 音质档 |
 | trigger | auto_parse | true | 链接自动解析 |
 | trigger | keywords | 解析音乐等 | 手动触发关键词 |
-| message | output_mode | video | link / audio / video |
+| message | output_mode | audio | link / audio / video (v0.3.13 默认 audio) |
 | message | show_cover | true | 发封面 |
 | message | show_lyric | false | 发歌词 |
 | message | video_fps | 2 | 视频帧数 |
