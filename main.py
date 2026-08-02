@@ -1,4 +1,4 @@
-"""astrbot_plugin_music_parser 主入口（v0.3.13 — 修复 video 模式 fetch failed）。
+"""astrbot_plugin_music_parser 主入口（v0.3.14 — 修复 Record API + 大 FLAC 超时）。
 
 进程内直接 import vendor 模块，零子进程。
 
@@ -6,6 +6,12 @@ v0.3.13 修复 video 模式 retcode=100 'fetch failed'：
 - Video 节点改用裸绝对路径而不是 file:// URI
 - video 模式发送失败时自动降级到 audio 模式 (Plain+Image+Record)
 - 默认 output_mode 从 'video' 改为 'audio'，降低默认踩坑概率
+
+v0.3.14 修复 Record API 改名 + 大 FLAC 30s 超时：
+- AstrBot 4.26.8 删除了 Record.fromFile, 必须用 Record.fromFileSystem
+- 本地文件 > 20MB 时跳过 Record, 直接走 File 组件 (Record 走 base64+wav
+  编码, 大文件 30s 超时; File 走 file:// raw multipart 上传, 大文件能过)
+- audio 模式 (as_record=True) fallback 用 File 而不是 Video, 用户期望的是音频
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ logger = get_logger()
     "astrbot_plugin_music_parser",
     "uuutt2023",
     "开箱即用的网易云 / QQ 音乐解析插件（进程内调用，零子进程）",
-    "0.3.13",
+    "0.3.14",
 )
 class MusicParserPlugin(Star):
 
@@ -338,22 +344,23 @@ class MusicParserPlugin(Star):
         return chain
 
     async def _send_chain(self, event, chain: list, meta) -> tuple[bool, str]:
-        """发送消息链，加 30s 超时保护。返回 (是否成功, 失败原因)。
+        """发送消息链，加超时保护。返回 (是否成功, 失败原因)。
 
+        v0.3.14: 默认超时从 30s 改为 60s，给大文件 (30MB+ FLAC) 留上传时间。
         v0.3.13：失败原因用于上层判断是否要降级 (例如 video 模式 retcode=100
         fetch failed → 降级到 audio 模式重发)。
         """
         try:
             await asyncio.wait_for(
                 event.send(event.chain_result(chain)),
-                timeout=30.0,
+                timeout=60.0,
             )
             i(f"[send_one] 已发送: {meta.name!r}")
             return True, ""
         except asyncio.TimeoutError:
-            reason = "timeout(30s)"
+            reason = "timeout(60s)"
             e(
-                f"[send_one] 发送超时（30s）: {meta.name!r} "
+                f"[send_one] 发送超时（60s）: {meta.name!r} "
                 f"chain_len={len(chain)} 可能因为音频文件过大导致 aiocqhttp 上传失败"
             )
         except Exception as exc:  # noqa: BLE001
