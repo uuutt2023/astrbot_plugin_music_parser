@@ -1,6 +1,11 @@
-"""astrbot_plugin_music_parser 主入口（v0.3.10 — 输出三选一 + 比例裁剪）。
+"""astrbot_plugin_music_parser 主入口（v0.3.13 — 修复 video 模式 fetch failed）。
 
 进程内直接 import vendor 模块，零子进程。
+
+v0.3.13 修复 video 模式 retcode=100 'fetch failed'：
+- Video 节点改用裸绝对路径而不是 file:// URI
+- video 模式发送失败时自动降级到 audio 模式 (Plain+Image+Record)
+- 默认 output_mode 从 'video' 改为 'audio'，降低默认踩坑概率
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ logger = get_logger()
     "astrbot_plugin_music_parser",
     "uuutt2023",
     "开箱即用的网易云 / QQ 音乐解析插件（进程内调用，零子进程）",
-    "0.3.10",
+    "0.3.13",
 )
 class MusicParserPlugin(Star):
 
@@ -219,6 +224,8 @@ class MusicParserPlugin(Star):
         """计算当前歌曲的输出配置 (output_mode / send_as_record / show_*)。
 
         v0.3.11: 从 _send_one 拆出，便于独立测试和复用。
+        v0.3.13: 默认 output_mode 从 'video' 改成 'audio'，因为 video 模式
+                 在 aiocqhttp + napcat 链路下经常踩 retcode=100 'fetch failed'。
         """
         cfg = self.config_manager
         show_text = cfg.parsers.has_text(meta.source)
@@ -227,9 +234,10 @@ class MusicParserPlugin(Star):
         show_lyric = show_text and bool(getattr(cfg.message, "show_lyric", False))
 
         # 归一化 output_mode (link / audio / video)
-        mode = str(getattr(cfg.message, "output_mode", "video") or "video").lower().strip()
+        # v0.3.13: 默认值改 'audio' (更稳), 历史 v0.3.9-v0.3.12 用户配 'video' 时仍走 video
+        mode = str(getattr(cfg.message, "output_mode", "audio") or "audio").lower().strip()
         if mode not in ("link", "audio", "video"):
-            mode = "video"
+            mode = "audio"
         send_as_record = bool(getattr(cfg.message, "send_as_record", True))
         # video 模式下强制不用 Record
         if mode == "video":
@@ -329,26 +337,74 @@ class MusicParserPlugin(Star):
             d(f"[send_one]   chain[{idx}] = {chain_node_summary(node)}")
         return chain
 
-    async def _send_chain(self, event, chain: list, meta) -> bool:
-        """发送消息链，加 30s 超时保护。返回是否发送成功。"""
+    async def _send_chain(self, event, chain: list, meta) -> tuple[bool, str]:
+        """发送消息链，加 30s 超时保护。返回 (是否成功, 失败原因)。
+
+        v0.3.13：失败原因用于上层判断是否要降级 (例如 video 模式 retcode=100
+        fetch failed → 降级到 audio 模式重发)。
+        """
         try:
             await asyncio.wait_for(
                 event.send(event.chain_result(chain)),
                 timeout=30.0,
             )
             i(f"[send_one] 已发送: {meta.name!r}")
-            return True
+            return True, ""
         except asyncio.TimeoutError:
+            reason = "timeout(30s)"
             e(
                 f"[send_one] 发送超时（30s）: {meta.name!r} "
                 f"chain_len={len(chain)} 可能因为音频文件过大导致 aiocqhttp 上传失败"
             )
         except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
             e(f"[send_one] 发送失败: {exc}\n{traceback.format_exc()}")
-        return False
+        return False, reason
+
+    async def _send_fallback_audio_mode(
+        self, event, meta, local_path, cfg_out: dict, reason: str
+    ) -> bool:
+        """v0.3.13 视频发送失败后的降级：用 audio 模式 (Plain+Image+Record) 重发。
+
+        返回是否降级发送成功。
+        """
+        try:
+            # 强制把 video 模式切到 audio, 走 Plain+Image+Record 链
+            degraded_cfg = dict(cfg_out)
+            degraded_cfg["output_mode"] = "audio"
+            degraded_cfg["send_as_record"] = True
+            from .utils.message_builder import build_song_chain
+
+            chain = build_song_chain(
+                meta,
+                show_text=degraded_cfg["show_text"],
+                show_cover=degraded_cfg["show_cover"],
+                show_audio=degraded_cfg["show_audio"],
+                show_lyric=degraded_cfg["show_lyric"],
+                as_record=degraded_cfg["send_as_record"],
+                local_audio_path=local_path,
+                synth_video_path=None,  # 不再用合成视频
+                output_mode="audio",
+            )
+            if not chain:
+                return False
+            i(
+                f"[send_one] video 模式发送失败 ({reason})，"
+                f"降级到 audio 模式重发 (chain_len={len(chain)})"
+            )
+            ok, _ = await self._send_chain(event, chain, meta)
+            if ok:
+                w(
+                    f"[send_one] ⚠️ 视频模式上传失败，已降级到音频+封面模式: "
+                    f"{meta.name!r} (原因: {reason})"
+                )
+            return ok
+        except Exception as exc:  # noqa: BLE001
+            e(f"[send_one] 降级到 audio 模式也失败: {type(exc).__name__}: {exc}")
+            return False
 
     async def _send_fallback_plain(self, event, meta, local_path) -> None:
-        """发送失败后补救：发一条 Plain 文本（直链 + 错误说明）。"""
+        """最后兜底：发一条 Plain 文本（直链 + 错误说明）。"""
         if not meta.audio_url:
             return
         try:
@@ -358,9 +414,9 @@ class MusicParserPlugin(Star):
                 f"🔗 音频直链：{meta.audio_url}"
             )
             await event.send(event.plain_result(fallback_text))
-            i(f"[send_one] 补救发送 Plain 链接成功: {meta.name!r}")
+            i(f"[send_one] 兜底发送 Plain 链接成功: {meta.name!r}")
         except Exception as exc:  # noqa: BLE001
-            e(f"[send_one] 补救发送也失败: {exc}")
+            e(f"[send_one] 兜底发送也失败: {exc}")
 
     def _schedule_cleanup(self, local_path, synth_video_path) -> None:
         """清理音频缓存和合成视频。"""
@@ -410,11 +466,21 @@ class MusicParserPlugin(Star):
         chain = self._build_chain(meta, local_path, synth_video_path, cfg_out)
 
         # 5) 发送
-        send_ok = await self._send_chain(event, chain, meta)
+        send_ok, fail_reason = await self._send_chain(event, chain, meta)
 
         # 6) 补救（发送失败时）
+        # v0.3.13: video 模式失败时优先降级到 audio 模式 (Plain+Image+Record)
+        # 而不是直接发 Plain 链接, 让用户至少能听到音频
         if not send_ok and cfg_out["show_audio"]:
-            await self._send_fallback_plain(event, meta, local_path)
+            # 6.1 优先尝试 audio 模式降级 (仅在原模式是 video 时)
+            degraded_ok = False
+            if cfg_out["output_mode"] == "video" and local_path and local_path.exists():
+                degraded_ok = await self._send_fallback_audio_mode(
+                    event, meta, local_path, cfg_out, fail_reason
+                )
+            # 6.2 仍失败, 发 Plain 链接兜底
+            if not degraded_ok:
+                await self._send_fallback_plain(event, meta, local_path)
 
         # 7) 清理缓存
         self._schedule_cleanup(local_path, synth_video_path)

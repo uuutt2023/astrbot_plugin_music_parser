@@ -12,6 +12,16 @@ v0.3.7 新增（修复"下载成功但不发送"）：
 - 大文件降级：超过 _LARGE_AUDIO_BYTES（默认 30MB）强制走 Plain 链接而不是
   Record/File.fromFile，避免 aiocqhttp 上传 55MB FLAC 静默卡死
 - 每个 component 构造都打印详细日志，方便定位哪一步崩了
+
+v0.3.13 新增（修复 video 模式 retcode=100 "fetch failed"）：
+- video 模式构造 Video 节点时用**裸绝对路径**而不是 `file://` URI。
+  因为 AstrBot 的 aiocqhttp 适配器在 File 组件上会自动把绝对路径转成
+  `file://` URI（更稳），但 Video 组件的 to_dict() 会**自作主张**用
+  Path.as_uri() 生成 `file://`，napcat 收到后经常在 fetch 阶段
+  报 retcode=100, wording='fetch failed'。这里我们直接把绝对路径传
+  给 Video.file，让适配器和 napcat 自己处理。
+- video 模式构造失败时返回 None，让调用方降级到 audio 模式（Plain+
+  Image+Record），而不是只发 Plain 链接（保留封面和音频体验）。
 """
 
 from __future__ import annotations
@@ -145,24 +155,34 @@ def _audio_component(
         # v0.3.7.5: 优先使用合成的封面视频
         if not as_record and synth_video_path and synth_video_path.exists():
             if Video is not None:
+                # v0.3.13 fix: 不再用 Video.fromFileSystem, 它会拼 file:// URI,
+                # napcat 收到后 fetch 阶段会 retcode=100 'fetch failed'。
+                # 直接 Video(file=绝对路径), 让 aiocqhttp 适配器自己处理。
+                abs_video_path = str(synth_video_path.resolve())
                 try:
-                    if hasattr(Video, "fromFileSystem"):
-                        node = Video.fromFileSystem(str(synth_video_path))
+                    node = Video(file=abs_video_path, path=abs_video_path)
+                    _log_i(
+                        f"[chain._audio] 使用 Video(file=绝对路径, 合成视频): "
+                        f"{abs_video_path}"
+                    )
+                    return node
+                except TypeError:
+                    # 老版本没有 path 参数
+                    try:
+                        node = Video(file=abs_video_path)
                         _log_i(
-                            f"[chain._audio] 使用 Video.fromFileSystem (合成视频): "
-                            f"{synth_video_path}"
+                            f"[chain._audio] 使用 Video(file=绝对路径, 无 path): "
+                            f"{abs_video_path}"
                         )
                         return node
-                    if hasattr(Video, "fromFile"):
-                        node = Video.fromFile(str(synth_video_path))
-                        _log_i(
-                            f"[chain._audio] 使用 Video.fromFile (合成视频): "
-                            f"{synth_video_path}"
+                    except Exception as exc:  # noqa: BLE001
+                        _log_w(
+                            f"[chain._audio] Video(file=...) 合成视频构造失败: "
+                            f"{type(exc).__name__}: {exc}"
                         )
-                        return node
                 except Exception as exc:  # noqa: BLE001
                     _log_w(
-                        f"[chain._audio] Video 合成视频构造失败: "
+                        f"[chain._audio] Video(file=...) 合成视频构造异常: "
                         f"{type(exc).__name__}: {exc}"
                     )
 
@@ -174,17 +194,27 @@ def _audio_component(
             except Exception as exc:  # noqa: BLE001
                 _log_w(f"[chain._audio] Record.fromFile 失败: {type(exc).__name__}: {exc}")
         if Video is not None:
+            # v0.3.13 fix: 同样避免 fromFileSystem (会拼 file:// URI)
+            abs_local_path = str(local_path.resolve())
             try:
-                if hasattr(Video, "fromFileSystem"):
-                    node = Video.fromFileSystem(str(local_path))
-                    _log_i(f"[chain._audio] 使用 Video.fromFileSystem: {local_path}")
+                node = Video(file=abs_local_path, path=abs_local_path)
+                _log_i(f"[chain._audio] 使用 Video(file=绝对路径, 本地): {abs_local_path}")
+                return node
+            except TypeError:
+                try:
+                    node = Video(file=abs_local_path)
+                    _log_i(f"[chain._audio] 使用 Video(file=绝对路径, 本地无 path): {abs_local_path}")
                     return node
-                if hasattr(Video, "fromFile"):
-                    node = Video.fromFile(str(local_path))
-                    _log_i(f"[chain._audio] 使用 Video.fromFile: {local_path}")
-                    return node
+                except Exception as exc:  # noqa: BLE001
+                    _log_w(
+                        f"[chain._audio] Video(file=绝对路径) 本地构造失败: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             except Exception as exc:  # noqa: BLE001
-                _log_w(f"[chain._audio] Video 本地构造失败: {type(exc).__name__}: {exc}")
+                _log_w(
+                    f"[chain._audio] Video(file=绝对路径) 本地构造异常: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         try:
             node = _try_make_file(str(local_path), name_hint=local_path.name)
             _log_i(f"[chain._audio] 使用 File(file=...): {local_path}")
@@ -236,7 +266,7 @@ def build_song_chain(
     as_record: bool = True,
     local_audio_path: Optional[Path] = None,
     synth_video_path: Optional[Path] = None,
-    output_mode: str = "video",
+    output_mode: str = "audio",
 ) -> list:
     """把 SongMetadata 渲染成 AstrBot 消息组件列表。
 
@@ -244,6 +274,11 @@ def build_song_chain(
       - "link":  文本 + 封面 + 直链 (Plain + Image + Plain URL) — 最稳，文件大也能看
       - "audio": 文本 + 封面 + 音频文件 (Plain + Image + Record/File/Video) — 需要下载发送
       - "video": 只发合成视频气泡 (Video only) — 封面+音频合一，无需额外文本/封面
+
+    v0.3.13: 默认值从 'video' 改为 'audio'，因为 video 模式在 aiocqhttp + napcat
+             链路下经常踩 retcode=100 'fetch failed' (Video.to_dict 把本地路径
+             拼成 file:// URI，napcat 上传阶段 fetch 失败)。如果你想用 video 模式
+             体验合成视频气泡，请显式传入 output_mode='video'。
 
     v0.3.7.5：接受 synth_video_path 参数（提前合成的封面+音频 视频文件）。
               传入后会优先使用合成视频，QQ 视频气泡每一帧都是封面。
@@ -259,25 +294,42 @@ def build_song_chain(
         return build_error_chain(meta)
 
     # 模式归一化
-    mode = (output_mode or "video").lower().strip()
+    mode = (output_mode or "audio").lower().strip()
     if mode not in ("link", "audio", "video"):
-        mode = "video"
+        mode = "audio"
 
     # === 模式 video: 只发合成视频气泡 ===
     if mode == "video":
         if synth_video_path and synth_video_path.exists() and Video is not None:
+            # v0.3.13 fix: 不再用 Video.fromFileSystem, 它会拼 file:// URI,
+            # napcat 收到后 fetch 阶段会 retcode=100 'fetch failed'。
+            # 直接 Video(file=绝对路径), 让 aiocqhttp 适配器自己处理。
+            abs_video_path = str(synth_video_path.resolve())
+            video_node = None
             try:
-                if hasattr(Video, "fromFileSystem"):
-                    chain.append(Video.fromFileSystem(str(synth_video_path)))
-                elif hasattr(Video, "fromFile"):
-                    chain.append(Video.fromFile(str(synth_video_path)))
-                else:
-                    chain.append(File(file=str(synth_video_path), name=synth_video_path.name))
-                _log_i(f"[chain.build] mode=video 只发合成视频气泡: {synth_video_path}")
-                return chain
+                video_node = Video(file=abs_video_path, path=abs_video_path)
+            except TypeError:
+                # 老版本没有 path 参数
+                try:
+                    video_node = Video(file=abs_video_path)
+                except Exception as exc:  # noqa: BLE001
+                    _log_w(
+                        f"[chain.build] Video(file=...) 合成视频构造失败: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             except Exception as exc:  # noqa: BLE001
-                _log_w(f"[chain.build] 合成视频构造失败: {type(exc).__name__}: {exc}")
-        # 合成视频不可用 -> 降级到 audio 模式
+                _log_w(
+                    f"[chain.build] Video(file=...) 合成视频构造异常: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if video_node is not None:
+                chain.append(video_node)
+                _log_i(
+                    f"[chain.build] mode=video 只发合成视频气泡: {abs_video_path} "
+                    f"(绝对路径，避免 file:// URI 导致 fetch failed)"
+                )
+                return chain
+        # 合成视频不可用或 Video 构造失败 -> 降级到 audio 模式
         _log_w("[chain.build] mode=video 但合成视频不可用，降级到 audio")
         mode = "audio"
 
