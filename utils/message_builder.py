@@ -5,7 +5,7 @@
 - 用 `Image` 输出封面（远程 URL 即可）
 - 用 `Record` 或 `File` 输出音频（远程 URL）
 
-为什么本地缓存？我们让 `File.fromFile` / `Record.fromFile` 在缓存可用时优先使用本地路径，
+为什么本地缓存？我们让 `File.fromFile` / `Record.fromFileSystem` 在缓存可用时优先使用本地路径，
 否则回退到远程 URL；这样 QQ / 微信等风控严格的平台也能稳定发出。
 
 v0.3.7 新增（修复"下载成功但不发送"）：
@@ -22,6 +22,19 @@ v0.3.13 新增（修复 video 模式 retcode=100 "fetch failed"）：
   给 Video.file，让适配器和 napcat 自己处理。
 - video 模式构造失败时返回 None，让调用方降级到 audio 模式（Plain+
   Image+Record），而不是只发 Plain 链接（保留封面和音频体验）。
+
+v0.3.14 新增（修复 Record API 改名 + 大 FLAC 30s 超时）：
+- AstrBot 4.26.8 重命名了 Record API：Record.fromFile 不存在了，必须用
+  Record.fromFileSystem(...) 或 Record.fromURL/Record.fromBase64
+- Record 走 aiocqhttp 时会被 convert_to_base64() 转 base64 字符串上传，
+  对于 30MB FLAC 这种大文件，base64 +33% 体积后约 40MB 字符串，会在
+  aiocqhttp 单帧上传阶段触发 30s 超时
+- 本地文件 > 20MB 时跳过 Record，直接走 File 组件（File 走文件上传，
+  走 napcat 内部 form-data 分块上传，不走 base64，更适合大文件）
+- audio 模式下 Record.fromFileSystem 失败时 fallback 用 File 而不是
+  Video（用户期望的是音频不是视频）
+- video 模式 Record fallback 逻辑也保持 File 优先，Video 仅在
+  synth_video_path 显式提供时使用
 """
 
 from __future__ import annotations
@@ -50,6 +63,11 @@ from ..core.logger import d as _log_d, w as _log_w, i as _log_i  # noqa: E402
 
 # 超过这个大小的音频文件直接走 Plain 链接，避免 aiocqhttp 上传大文件静默卡死
 _LARGE_AUDIO_BYTES = 30 * 1024 * 1024  # 30MB
+
+# v0.3.14: Record 走 aiocqhttp 时会 convert_to_base64 (转 wav 再 base64),
+# 30MB FLAC 转 base64 +33% 体积后约 40MB 字符串, 容易触发 30s 超时。
+# 本地文件 > 20MB 时跳过 Record, 改走 File 组件 (File 走文件上传, 不走 base64)
+_RECORD_MAX_BYTES = 20 * 1024 * 1024  # 20MB
 
 
 def _truncate_lyric(lyric: str | None, max_lines: int = 30) -> str:
@@ -134,6 +152,17 @@ def _audio_component(
     v0.3.7.1：不再预判大文件降级。直接构造组件，让 event.send 走实际路径。
     v0.3.7.2：File 类用 File(file=...) 构造，不用 .fromFile/.fromURL。
     v0.3.7.3：as_record=false 时优先用 Video 组件（参考 astrbot_plugin_media_parser）。
+
+    v0.3.14 修复:
+    - AstrBot 4.26.8 重命名了 Record API, Record.fromFile 不存在, 必须
+      用 Record.fromFileSystem (会拼 file:// URI) 或 Record.fromURL /
+      Record.fromBase64。注意 Record 走 aiocqhttp 时会 convert_to_base64
+      (转 wav 再 base64), 大文件 (FLAC 30MB) 会触发 30s 超时。
+    - 本地文件 > 20MB 时跳过 Record, 直接走 File 组件 (走文件上传不走 base64)
+    - audio 模式 (as_record=True) 下, Record 失败的 fallback 用 File,
+      而不是 Video (用户期望的是音频不是视频)
+    - video 模式 (as_record=False) 下, 只有显式提供 synth_video_path
+      才走 Video; 本地音频文件 fallback 仍然用 File
     """
     if not _HAVE_ASTRBOT:
         return None
@@ -152,7 +181,8 @@ def _audio_component(
 
     # 本地缓存路径优先
     if local_path and local_path.exists():
-        # v0.3.7.5: 优先使用合成的封面视频
+        # video 模式 (as_record=False) 且显式提供合成视频: 走 Video 节点
+        # (其他场景 video 模式也只是想要音频, 不应该 fallback 到 Video)
         if not as_record and synth_video_path and synth_video_path.exists():
             if Video is not None:
                 # v0.3.13 fix: 不再用 Video.fromFileSystem, 它会拼 file:// URI,
@@ -186,35 +216,35 @@ def _audio_component(
                         f"{type(exc).__name__}: {exc}"
                     )
 
-        if as_record:
+        # audio 模式 + 文件大小合理: 走 Record
+        # v0.3.14: > 20MB 直接走 File (Record 会 base64 编码, 大文件超时)
+        if as_record and file_size <= _RECORD_MAX_BYTES:
             try:
-                node = Record.fromFile(str(local_path))
-                _log_i(f"[chain._audio] 使用 Record.fromFile: {local_path}")
-                return node
-            except Exception as exc:  # noqa: BLE001
-                _log_w(f"[chain._audio] Record.fromFile 失败: {type(exc).__name__}: {exc}")
-        if Video is not None:
-            # v0.3.13 fix: 同样避免 fromFileSystem (会拼 file:// URI)
-            abs_local_path = str(local_path.resolve())
-            try:
-                node = Video(file=abs_local_path, path=abs_local_path)
-                _log_i(f"[chain._audio] 使用 Video(file=绝对路径, 本地): {abs_local_path}")
-                return node
-            except TypeError:
-                try:
-                    node = Video(file=abs_local_path)
-                    _log_i(f"[chain._audio] 使用 Video(file=绝对路径, 本地无 path): {abs_local_path}")
-                    return node
-                except Exception as exc:  # noqa: BLE001
-                    _log_w(
-                        f"[chain._audio] Video(file=绝对路径) 本地构造失败: "
-                        f"{type(exc).__name__}: {exc}"
+                # v0.3.14 fix: AstrBot 4.26.8 改名为 Record.fromFileSystem
+                if hasattr(Record, "fromFileSystem"):
+                    node = Record.fromFileSystem(str(local_path))
+                elif hasattr(Record, "fromFile"):
+                    # 旧版 API 兼容
+                    node = Record.fromFile(str(local_path))
+                else:
+                    raise AttributeError(
+                        "Record 没有 fromFileSystem/fromFile 方法"
                     )
+                _log_i(f"[chain._audio] 使用 Record.fromFileSystem: {local_path}")
+                return node
             except Exception as exc:  # noqa: BLE001
                 _log_w(
-                    f"[chain._audio] Video(file=绝对路径) 本地构造异常: "
+                    f"[chain._audio] Record.fromFileSystem 失败: "
                     f"{type(exc).__name__}: {exc}"
                 )
+        elif as_record and file_size > _RECORD_MAX_BYTES:
+            _log_i(
+                f"[chain._audio] 本地文件 {file_size // 1024 // 1024}MB > "
+                f"20MB 阈值, 跳过 Record 走 File (避免 base64 上传超时)"
+            )
+
+        # v0.3.14: audio 模式 fallback 用 File (不走 Video, 用户期望的是音频)
+        # 任何 mode 的本地文件最终兜底都是 File
         try:
             node = _try_make_file(str(local_path), name_hint=local_path.name)
             _log_i(f"[chain._audio] 使用 File(file=...): {local_path}")
@@ -223,7 +253,7 @@ def _audio_component(
             _log_w(f"[chain._audio] File 构造失败: {type(exc).__name__}: {exc}")
 
     # 回退到远程 URL
-    if as_record:
+    if as_record and file_size <= _RECORD_MAX_BYTES:
         try:
             node = Record.fromURL(meta.audio_url)
             _log_i(f"[chain._audio] 使用 Record.fromURL: {meta.audio_url[:60]}...")
