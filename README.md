@@ -47,32 +47,82 @@ WebUI → 音乐解析插件 → 配置：
 
 | 值 | 发什么 | 稳定性 |
 |----|--------|--------|
-| `audio`（默认 v0.3.13+） | 文本+封面+音频文件 | ★★★ 稳，QQ 兼容最好 |
-| `video` | 合成视频气泡，封面+音频合一 | ★★ 体验最好但容易踩 retcode=100 `fetch failed`，失败会自动降级到 `audio` 模式 |
+| `audio`（默认） | 文本+封面+音频文件，超大文件自动压成 mp3 | ★★★ 稳，QQ 兼容最好 |
+| `video` | 合成视频气泡，封面+音频合一，**独占一条消息** | ★★ 体验最好，需要 ffmpeg |
 | `link` | 文本+封面+直链，不下载音频 | ★★★ 最稳，但用户需自己点链接收听 |
 
 视频气泡的封面比例自适应，帧数和视频上限可在 `video_fps`、`video_max_width`、`video_max_height` 调。
 
-> **v0.3.13 默认值变更**：默认从 `video` 改为 `audio`。`video` 模式在 aiocqhttp + napcat 链路下经常触发 `retcode=100, wording='fetch failed'`（Video 节点上传阶段 fetch 本地 `file://` URI 失败）。如果你用 `video` 模式，v0.3.13 已加上自动降级：视频发送失败时降级到 `audio` 模式（Plain+Image+Record）重发一次，至少能保证用户听到声音。如果你不想用 video，直接在 WebUI 改回 `audio` 即可。
+> `video` 模式下视频会作为**独立的一条消息**发出 —— 协议端（SnowLuma 的
+> `assertVideoSendPolicy`）明确要求 video 必须是消息里唯一的段，和文本封面混发
+> 会直接被拒（`retcode=1400`）。
+
+### 大文件为什么发不出去（v0.3.15 起自动处理）
+
+AstrBot 的 aiocqhttp 适配器对语音（`Record`）组件是**无条件 base64** 的：
+
+```python
+if isinstance(segment, Image | Record):
+    bs64 = await segment.convert_to_base64()
+```
+
+而 `Record.convert_to_base64()` 内部走 `to_base64(target_format="wav")` ——
+**它会先用 ffmpeg 把音频解码成 PCM WAV，再 base64**。于是：
+
+```
+40MB FLAC（约 4 分钟）→ 42MB WAV → 56MB base64 字符串 → 一个 WebSocket JSON 帧
+```
+
+这个膨胀发生在 **AstrBot 内部**，还没走到协议端那一步 —— 换 NapCat、换
+SnowLuma 都一样会失败。所谓「QQ 平台限制」其实是这条链路的副作用。
+
+v0.3.15 起，插件在交给 AstrBot **之前**先用 ffmpeg 把超大音频压成 mp3：
+
+```
+[audio_fit] 源 song.flac 26MB (时长 240s, 转 WAV 约 40MB → base64 约 54MB)，
+            超过 8MB → 转 mp3 @128kbps
+[audio_fit] 转码完成: song.flac 26MB → song.qq.mp3 3MB @128kbps
+```
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `message.record_max_mb` | 8 | 语音发送体积上限，超过就转码 |
+| `message.record_bitrate_kbps` | 128 | 转码目标码率上限（实际会按时长自动下调） |
+| `message.record_transcode` | true | 关掉就只做体积判断，超大文件直接给直链 |
+| `message.send_timeout` | 60 | 单次发送超时（秒），网络慢可以调大 |
+
+没装 ffmpeg 时，`record_max_mb` 以上会降级为群文件附件或直链。
 
 ## 故障排查
 
 ### 大文件不发送
 
-QQ 平台对音频文件大小有限制。`message.output_mode` 切到 `link` 看直链，或用 `audio` 模式发小一点的音质。
+先确认日志里有没有 `[audio_fit]` 段：
+
+- 有 `[audio_fit] 转码完成` 但仍失败 → 看紧跟其后的 `[send_one] 发送失败`，可能是网络或协议端问题
+- 有 `[audio_fit] 转码失败` → 没装 ffmpeg，或 `record_transcode` 被关了。装 ffmpeg，或把 `record_max_mb` 调小，或改用 `link` 模式
+
+### `retcode=1400 ... "video" must be the only segment in a message`
+
+协议端拒绝把视频和别的段放同一条消息。v0.3.15 已用 `split_chain_for_send()`
+自动拆开发送，日志里会出现：
+
+```
+[send_one] 消息链含 Video，拆成 N 条分别发送
+```
+
+如果还报这个错，说明跑的还是旧版本插件，检查一下 WebUI 里插件版本是不是 0.3.15。
+
+### `AttributeError: type object 'Record' has no attribute 'fromFile'`
+
+AstrBot 4.26.8 移除了 `Record.fromFile`。v0.3.15 已改成能力探测
+（`fromFileSystem` → 构造器 → `fromURL`），看到这条就是旧版本插件。
 
 ### 视频模式 `retcode=100, fetch failed`
 
-这是 **video 输出模式** 在 aiocqhttp + napcat 链路下的已知问题：插件合成 mp4 后用 `Video` 节点上传，napcat 拿到 `file:///...` 本地路径后去 fetch，但 file:// 协议在 fetch 阶段经常失败。
-
-v0.3.13 已修复：
-1. **video 模式构造 Video 节点改用裸绝对路径**（不再自动拼 `file://` URI），部分 napcat 版本能识别
-2. **video 发送失败时自动降级到 audio 模式**（Plain+Image+Record 重发），用户至少能听到音频
-3. **默认 output_mode 改为 `audio`**，降低默认踩坑概率
-
-如果仍然想用 video 模式又稳定发不出，请确认：
-- napcat 版本是最新（`fetch failed` 修复在 napcat 较新版本里）
-- 或者切到 `audio` / `link` 模式
+video 模式上传本地路径时协议端 fetch 失败。v0.3.15 已改用裸绝对路径
+（不再拼 `file://` URI），并在发送失败时自动降级到 `audio` 模式重发。
+仍然失败就切到 `audio` / `link` 模式。
 
 ### 日志里没 `[music_parser]` 字样
 
@@ -86,6 +136,15 @@ WebUI → 配置 → `debug.verbose_log` 设为 `true` → 再发一次链接 �
 
 Cookie 不是会员账号。网易云换黑胶会员重新拿 Cookie，QQ 音乐换绿钻。
 
+## 测试
+
+```bash
+python3 tests/test_send_pipeline.py
+```
+
+用假的 astrbot 组件 + 真实 ffmpeg 跑完整发送链路，覆盖配置读取、Record API
+能力探测、Video 拆分、超大文件转码等场景（需要系统装有 ffmpeg）。
+
 ## 架构
 
 ```
@@ -95,12 +154,15 @@ AstrBot 进程
 │   ├── link_extractor.py    文本/卡片 URL 提取 + 音乐域名白名单
 │   ├── parser_manager.py    平台分发
 │   ├── downloader.py        音频下载 + 缓存清理
+│   ├── audio_fitter.py      超大音频转 mp3（Record 体积治理）
 │   ├── video_synthesizer.py 封面+音频合成 mp4
 │   └── parsers/
 │       ├── netease.py       sys.path 注入 → import music_api
 │       └── tencent.py       sys.path 注入 → from app import QQMusic
 ├── utils/
-│   └── message_builder.py   SongMetadata → AstrBot 消息链
+│   └── message_builder.py   SongMetadata → AstrBot 消息链（含 Video 拆条）
+├── tests/
+│   └── test_send_pipeline.py 发送链路回归测试
 └── vendor/                  内置的开源后端源码，不修改
     ├── netease_url/         Suxiaoqinx/Netease_url
     └── tencent_url/         Suxiaoqinx/tencent_url
@@ -122,9 +184,13 @@ WebUI 可视化配置，schema 在 `_conf_schema.json`。常用字段：
 | quality | tencent_level | flac | QQ 音质档 |
 | trigger | auto_parse | true | 链接自动解析 |
 | trigger | keywords | 解析音乐等 | 手动触发关键词 |
-| message | output_mode | audio | link / audio / video (v0.3.13 默认 audio) |
+| message | output_mode | audio | link / audio / video |
 | message | show_cover | true | 发封面 |
 | message | show_lyric | false | 发歌词 |
+| message | record_max_mb | 8 | 语音体积上限，超过自动转 mp3 |
+| message | record_bitrate_kbps | 128 | 转码目标码率上限 |
+| message | record_transcode | true | 是否自动转码 |
+| message | send_timeout | 60 | 单次发送超时（秒） |
 | message | video_fps | 2 | 视频帧数 |
 | message | video_max_width | 1920 | 视频最大宽度 |
 | message | video_max_height | 1080 | 视频最大高度 |

@@ -65,6 +65,23 @@ class MessageConfig:
     send_as_record: bool = True
     show_cover: bool = True
 
+    # v0.3.15 修复：这些字段在 _conf_schema.json 里早就存在，但 ConfigManager
+    # 从来没读过，main.py 用 getattr(cfg.message, "output_mode", "audio") 取值
+    # 时永远拿到默认值 —— 用户在 WebUI 里选了 video 却被静默忽略。
+    output_mode: str = "audio"          # link / audio / video
+    video_fps: int = 2
+    video_max_width: int = 1920
+    video_max_height: int = 1080
+
+    # v0.3.15 新增：音频体积治理
+    # AstrBot 的 aiocqhttp 适配器会把 Record 组件无条件转成 base64 WAV
+    # （ensure_wav → PCM → base64），40MB FLAC 会膨胀成 ~56MB 的单个 JSON 帧，
+    # 直接把 WebSocket 打爆。超过 record_max_mb 就先用 ffmpeg 压成 mp3。
+    record_max_mb: int = 8              # 超过这个体积就转码
+    record_bitrate_kbps: int = 128      # 转码目标码率（上限，实际会按时长自动降）
+    record_transcode: bool = True       # 关掉就只做体积判断，不转码
+    send_timeout: int = 60              # 单次发送超时（秒）
+
 
 @dataclass
 class PermissionConfig:
@@ -128,12 +145,33 @@ class ConfigManager:
         )
 
         m = raw.get("message") or {}
+
+        def _mode(raw_value, default: str = "audio") -> str:
+            """output_mode 归一化：只认 link/audio/video，别的（含空）回默认。"""
+            v = str(raw_value or "").strip().lower()
+            return v if v in ("link", "audio", "video") else default
+
+        def _int(raw_value, default: int, *, low: int, high: int) -> int:
+            """把配置值安全转成 [low, high] 区间内的整数，非法值回退默认。"""
+            try:
+                return max(low, min(int(raw_value), high))
+            except (TypeError, ValueError):
+                return default
+
         self.message = MessageConfig(
             opening_enabled=bool(m.get("opening_enabled", True)),
             opening_content=m.get("opening_content", "🎵 音乐解析小助手为您服务～"),
             show_lyric=bool(m.get("show_lyric", False)),
             send_as_record=bool(m.get("send_as_record", True)),
             show_cover=bool(m.get("show_cover", True)),
+            output_mode=_mode(m.get("output_mode")),
+            video_fps=_int(m.get("video_fps"), 2, low=1, high=30),
+            video_max_width=_int(m.get("video_max_width"), 1920, low=64, high=4096),
+            video_max_height=_int(m.get("video_max_height"), 1080, low=64, high=4096),
+            record_max_mb=_int(m.get("record_max_mb"), 8, low=1, high=100),
+            record_bitrate_kbps=_int(m.get("record_bitrate_kbps"), 128, low=32, high=320),
+            record_transcode=bool(m.get("record_transcode", True)),
+            send_timeout=_int(m.get("send_timeout"), 60, low=5, high=600),
         )
 
         p = raw.get("permission") or {}
