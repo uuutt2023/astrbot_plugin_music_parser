@@ -93,6 +93,78 @@ v0.3.15 起，插件在交给 AstrBot **之前**先用 ffmpeg 把超大音频压
 
 没装 ffmpeg 时，`record_max_mb` 以上会降级为群文件附件或直链。
 
+## 性能
+
+对 async 机器人插件来说，最要命的性能问题不是"慢"，而是**阻塞 event loop**——
+一旦某段同步代码卡住主循环，整个 bot 在那段时间内对**所有**消息都无响应，
+而不只是当前这一首歌。
+
+### 实测数据
+
+`tests/profile_pipeline.py`，240s / 26.9MB 无损 + 真实封面图，`_send_one` 全流程：
+
+| 场景 | v0.3.15 | v0.3.16 | 变化 |
+|------|--------|--------|------|
+| `audio`（默认）总耗时 | 26.70s | **3.39s** | −87% |
+| `audio` event loop 最长卡顿 | 0.181s | **0.067s** | −63% |
+| `video` 总耗时 | 0.07s | 0.07s | — |
+| `link` 总耗时 | 0.07s | 0.07s | — |
+
+逐函数卡顿（`tests/profile_loop_blocking.py`）：
+
+| 调用 | 耗时 | event loop 卡顿 |
+|------|------|-----------------|
+| `probe_duration`（同步，故意） | 0.12s | 0.116s |
+| `probe_duration_async`（executor） | 0.10s | **0.001s** |
+| `synthesize_cover_audio_video` | 3.49s | 0.040s |
+| `fit_audio_for_record`（26MB → mp3） | 4.10s | 0.018s |
+
+### v0.3.16 修了什么
+
+**① audio 模式白合成封面视频（最大的一处）**
+
+`_maybe_synth_video` 以前只要 `output_mode != 'link'` 就合成，于是**默认的 audio
+模式也在跑 ffmpeg**。但 audio 模式下 `send_as_record=True`，而 `_audio_component`
+的 Video 分支要求 `not as_record` —— 合成出来的 mp4 从头到尾没人用。
+
+实测：合成耗时 **23.20s**、产出 6MB mp4，最终音频组件用的却是 Record。
+每首歌白等二十多秒。现在只有 `output_mode == 'video'` 才合成。
+
+**② 子进程调用挪出 event loop**
+
+`_extract_embedded_cover` 和 `probe_duration` 都是 `subprocess.run` 同步调用，
+直接卡住 event loop。现在都通过 `run_in_executor` 丢进线程池。
+（`_run_ffmpeg_synth` 原本就已经在 executor 里。）
+
+**③ 封面下载复用 HTTP 连接**
+
+`_download_cover` 以前每次都 `async with aiohttp.ClientSession()`，等于每首歌
+重做一次 TCP + TLS 握手、用完立刻关掉。现在进程内共享一个 session，并绑定到
+创建它的 event loop（换 loop 时自动重建，避免 aiohttp 报错）。插件 `terminate()`
+时释放。
+
+**④ 顺带修了个静默 bug**
+
+`_probe_cover_size` 写死调用 `"ffprobe"` 走 PATH 查找，但 `find_ffmpeg()` 可能返回
+imageio-ffmpeg 自带的 ffmpeg——**那个包里没有 ffprobe**。于是每次都白 spawn 一次
+进程再吃 `FileNotFoundError`，静默退回 1920x1080。现在从 ffmpeg 实际路径推导
+ffprobe，与 `audio_fitter.probe_duration` 保持一致。
+
+### 怎么复现这些数字
+
+```bash
+python3 tests/profile_loop_blocking.py   # 逐函数卡顿
+python3 tests/profile_pipeline.py        # 端到端 A/B
+```
+
+两个脚本都需要系统装有 ffmpeg。
+
+> ⚠️ **关于卡顿探针**：`tests/_fake_env.py` 里的 `LagMonitor` 在测量前会先自检
+> （已知阻塞必须被测出、纯异步等待必须不算卡顿），自检不过直接拒绝输出结论。
+> 这一点是被现实教育过的——最初版本的 `__aexit__` 在 monitor 记录到阻塞之前就
+> `cancel()` 了任务，导致**所有卡顿数字都报成 0.000s**。测性能的工具本身没被
+> 验证过之前，它的输出没有意义。
+
 ## 故障排查
 
 ### 大文件不发送
@@ -139,11 +211,13 @@ Cookie 不是会员账号。网易云换黑胶会员重新拿 Cookie，QQ 音乐
 ## 测试
 
 ```bash
-python3 tests/test_send_pipeline.py
+python3 tests/test_send_pipeline.py       # 52 项断言：发送链路
+python3 tests/profile_loop_blocking.py    # 逐函数 event loop 卡顿
+python3 tests/profile_pipeline.py         # 端到端 A/B 性能
 ```
 
 用假的 astrbot 组件 + 真实 ffmpeg 跑完整发送链路，覆盖配置读取、Record API
-能力探测、Video 拆分、超大文件转码等场景（需要系统装有 ffmpeg）。
+能力探测、Video 拆分、超大文件转码等场景（需要系统装有 ffmpeg）。详见[性能](#性能)一节。
 
 ## 架构
 

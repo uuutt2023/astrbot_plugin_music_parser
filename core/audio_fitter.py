@@ -93,6 +93,17 @@ def probe_duration(audio_path: Path) -> float:
         return 0.0
 
 
+async def probe_duration_async(audio_path: Path) -> float:
+    """异步版 probe_duration：把 ffprobe 子进程丢进 executor，不阻塞 event loop。
+
+    v0.3.16 性能修复：`probe_duration` 是 subprocess.check_output(timeout=20)，
+    同步调用会把 event loop 卡住 —— 对 async bot 来说这段时间它对所有消息都无响应。
+    实测单次 ffprobe 卡顿 ~0.1s。
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, probe_duration, Path(audio_path))
+
+
 def _transcode_cache_path(src: Path) -> Path:
     """转码产物路径：<源名>.qq.mp3，和源文件同目录。"""
     return src.with_name(f"{src.stem}.qq.mp3")
@@ -156,7 +167,8 @@ async def fit_audio_for_record(
     if not ffmpeg:
         return None, f"{size // 1024 // 1024}MB 超过 {max_mb}MB，且找不到 ffmpeg"
 
-    duration = probe_duration(src)
+    # v0.3.16：异步版，避免 ffprobe 子进程阻塞 event loop
+    duration = await probe_duration_async(src)
     if duration > _MAX_RECORD_SECONDS:
         return None, (
             f"时长 {int(duration // 60)} 分 {int(duration % 60)} 秒 "

@@ -15,10 +15,20 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .logger import i as _log_i, w as _log_w
+from .logger import d as _log_d, i as _log_i, w as _log_w
 
 _FFMPEG_EXE: Optional[str] = None
 _FFMPEG_PROBED = False
+
+# v0.3.16：跨调用复用的 aiohttp session（避免每首歌重做 TCP+TLS 握手）
+_SHARED_SESSION: Optional[tuple] = None
+
+
+def aiohttp_timeout():
+    """构造 aiohttp timeout（延迟 import，方便无 aiohttp 环境下降级）。"""
+    import aiohttp
+
+    return aiohttp.ClientTimeout(total=15)
 
 
 def find_ffmpeg() -> Optional[str]:
@@ -55,24 +65,84 @@ def find_ffmpeg() -> Optional[str]:
     return None
 
 
+async def _get_shared_session():
+    """取共享 aiohttp session（懒创建）。
+
+    v0.3.16 性能修复：原来每次下载封面都 `async with aiohttp.ClientSession()`，
+    等于每首歌重新做一次 TCP + TLS 握手、用完立刻关掉，连接池完全没用上。
+    改成进程内共享一个 session。
+
+    绑定到创建它的 event loop：插件正常运行期间是同一个 loop，但如果测试或
+    异常路径换了 loop，aiohttp 会因为 session 绑死在旧 loop 上而报错 ——
+    检测到 loop 变了就丢弃重建，比直接抛异常好。
+    """
+    global _SHARED_SESSION
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if _SHARED_SESSION is not None:
+        sess, sess_loop = _SHARED_SESSION
+        if sess_loop is loop and not sess.closed:
+            return sess
+        if not sess.closed and sess_loop is not loop:
+            try:
+                await sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        import aiohttp
+
+        _SHARED_SESSION = (aiohttp.ClientSession(), loop)
+        return _SHARED_SESSION[0]
+    except Exception as exc:  # noqa: BLE001
+        _log_w(f"[video_synth] 创建共享 HTTP session 失败: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def close_shared_session() -> None:
+    """插件 terminate 时调用，释放共享 session。"""
+    global _SHARED_SESSION
+    if _SHARED_SESSION is not None:
+        sess, _ = _SHARED_SESSION
+        if not sess.closed:
+            try:
+                await sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _SHARED_SESSION = None
+
+
 async def _download_cover(cover_url: str, target: Path) -> bool:
     """下载封面图到本地。失败返回 False。"""
     if not cover_url:
         return False
+    session = await _get_shared_session()
+    # 拿不到共享 session 就退回一次性 session（正确性优先于性能）
+    if session is not None:
+        return await _download_cover_with(session, cover_url, target)
     try:
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(cover_url, timeout=timeout) as resp:
-                if resp.status >= 400:
-                    _log_w(f"[video_synth] 下载封面失败 HTTP {resp.status}: {cover_url[:60]}")
-                    return False
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as f:
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        if chunk:
-                            f.write(chunk)
+        async with aiohttp.ClientSession() as tmp:
+            return await _download_cover_with(tmp, cover_url, target)
+    except Exception as exc:  # noqa: BLE001
+        _log_w(f"[video_synth] 下载封面异常: {type(exc).__name__}: {exc}")
+        return False
+
+
+async def _download_cover_with(session, cover_url: str, target: Path) -> bool:
+    try:
+        timeout = aiohttp_timeout()
+        async with session.get(cover_url, timeout=timeout) as resp:
+            if resp.status >= 400:
+                _log_w(f"[video_synth] 下载封面失败 HTTP {resp.status}: {cover_url[:60]}")
+                return False
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as f:
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    if chunk:
+                        f.write(chunk)
         return target.exists() and target.stat().st_size > 0
     except Exception as exc:  # noqa: BLE001
         _log_w(f"[video_synth] 下载封面异常: {type(exc).__name__}: {exc}")
@@ -119,8 +189,18 @@ def _probe_cover_size(cover_path: Path) -> Tuple[int, int]:
     except Exception:
         pass
     try:
+        # v0.3.16 修复：原来写死 "ffprobe"，靠 PATH 查找。但 find_ffmpeg() 可能
+        # 返回 imageio-ffmpeg 自带的 ffmpeg —— 那个包里**没有 ffprobe**，
+        # 于是每次都白 spawn 一次进程再吃 FileNotFoundError，静默退回 1920x1080。
+        # 现在从 ffmpeg 的实际路径推导 ffprobe，与 audio_fitter.probe_duration 保持一致。
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise FileNotFoundError("ffmpeg 不可用")
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe"))
+        if not Path(ffprobe).exists():
+            raise FileNotFoundError(f"ffprobe 不存在: {ffprobe}")
         probe_cmd = [
-            "ffprobe",
+            ffprobe,
             "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height",
@@ -132,7 +212,8 @@ def _probe_cover_size(cover_path: Path) -> Tuple[int, int]:
         ).decode().strip()
         w, h = out.split("x")
         return int(w), int(h)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        _log_d(f"[video_synth] 探测封面尺寸失败，用默认值 1920x1080: {type(exc).__name__}")
         return 1920, 1080
 
 
@@ -284,6 +365,9 @@ async def synthesize_cover_audio_video(
     if not audio_path.exists():
         return False, f"audio not found: {audio_path}"
 
+    # 所有阻塞调用（ffmpeg / ffprobe 子进程）都通过这个 loop 丢进线程池
+    loop = asyncio.get_running_loop()
+
     # 1) 准备封面图
     cover_path = output_path.parent / f".{output_path.name}.cover.jpg"
     cover_ok = False
@@ -296,8 +380,14 @@ async def synthesize_cover_audio_video(
             cover_source = "url"
 
     # 1b) 退回：从音频文件内嵌封面提取
+    #     v0.3.16 性能修复：这里是 subprocess.run(timeout=20)，**同步**调用会直接
+    #     卡住 event loop。async bot 被卡住意味着这段时间内它对所有消息都无响应，
+    #     不只是当前这首。丢进 executor 执行。
     if not cover_ok:
-        if _extract_embedded_cover(audio_path, cover_path):
+        extracted = await loop.run_in_executor(
+            None, _extract_embedded_cover, audio_path, cover_path
+        )
+        if extracted:
             cover_ok = True
             cover_source = "embedded"
 
@@ -319,7 +409,6 @@ async def synthesize_cover_audio_video(
     )
 
     # 2) ffmpeg 合成（丢到线程池避免阻塞 event loop）
-    loop = asyncio.get_event_loop()
 
     def _synth_call():
         return _run_ffmpeg_synth(

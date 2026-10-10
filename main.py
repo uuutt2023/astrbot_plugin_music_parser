@@ -1,6 +1,17 @@
-"""astrbot_plugin_music_parser 主入口（v0.3.15 — 修 Record/video 发送链路）。
+"""astrbot_plugin_music_parser 主入口（v0.3.16 — 发送链路修复 + 性能）。
 
 进程内直接 import vendor 模块，零子进程。
+
+v0.3.16 性能修复（全部基于实测，见 README「性能」一节）：
+- **audio 模式不再白合成封面视频。** 以前只要 output_mode 不是 'link' 就合成，
+  但 audio 模式下 send_as_record=True，`_audio_component` 的 Video 分支要求
+  `not as_record`，那个 mp4 从头到尾没人用。实测 240s 无损 + 真实封面：
+  合成耗时 23.20s、产出 6MB mp4，最终音频组件却是 Record —— 纯浪费。
+  端到端实测 26.70s → 3.39s（−87%）。
+- 子进程调用（ffmpeg/ffprobe）全部挪出 event loop。对 async bot 来说被阻塞
+  = 期间对**所有**消息无响应，不只是当前这首。实测 probe_duration 同步调用
+  卡顿 0.116s → executor 版 0.001s。
+- video_synthesizer 复用 aiohttp session，不再每首歌重做一次 TCP+TLS 握手。
 
 v0.3.15 修的三个坑（都来自真实日志 / 协议端源码）：
 
@@ -55,7 +66,7 @@ from .core.parser_manager import ParserManager
 
 logger = get_logger()
 
-PLUGIN_VERSION = "0.3.15"
+PLUGIN_VERSION = "0.3.16"
 
 
 @register(
@@ -150,6 +161,13 @@ class MusicParserPlugin(Star):
             await self.download_manager.shutdown()
         if self._http and not self._http.closed:
             await self._http.close()
+        # v0.3.16：释放 video_synthesizer 的共享 HTTP session
+        try:
+            from .core.video_synthesizer import close_shared_session
+
+            await close_shared_session()
+        except Exception as exc:  # noqa: BLE001
+            w(f"[terminate] 关闭共享 session 失败: {exc}")
         i("[terminate] 已清理资源")
 
     # ─────────────── 消息分发核心 ───────────────
@@ -311,14 +329,31 @@ class MusicParserPlugin(Star):
     async def _maybe_synth_video(
         self, meta, local_path: Optional[Path], cfg_out: dict
     ) -> Optional[Path]:
-        """合成 封面+音频 视频气泡 (output_mode in audio/video)。
+        """合成 封面+音频 视频气泡 —— **仅 video 模式需要**。
 
-        失败返回 None (调用方降级处理)。
+        v0.3.16 性能修复：以前只要 output_mode 不是 'link' 就合成，于是默认的
+        audio 模式也在合成。问题是 audio 模式下 send_as_record=True，
+        `_audio_component` 的 Video 分支要求 `not as_record`，根本不会去用这个
+        合成视频 —— 也就是说每首歌白白跑一次 ffmpeg。
+
+        实测（240s 无损 + 真实封面图）：合成耗时 23.20s、产出 6MB mp4，
+        最终音频组件用的却是 Record/File，那 23 秒和 6MB 磁盘全是纯浪费。
+        bot 表现为"发一首歌要等二十多秒"。
+
+        现在只有 output_mode == 'video' 才合成。失败返回 None（调用方降级）。
+
+        注意：video 模式本身要求 ffmpeg + 封面可用，所以这条路天然只在
+        "确实要用视频"时才付这个成本。
         """
         cfg = self.config_manager
-        if not (local_path and local_path.exists() and meta.pic_url):
+        if cfg_out["output_mode"] != "video":
+            # audio 模式用不到合成视频；link 模式连音频都不发
+            d(
+                f"[send_one] output_mode={cfg_out['output_mode']}，"
+                f"跳过封面视频合成（audio/link 模式不会用到 Video 节点）"
+            )
             return None
-        if cfg_out["output_mode"] == "link":
+        if not (local_path and Path(local_path).exists() and meta.pic_url):
             return None
         try:
             from .core.video_synthesizer import synthesize_to_temp
