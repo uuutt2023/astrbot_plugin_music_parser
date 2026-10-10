@@ -113,7 +113,7 @@
   },
   "message": {
     "description": "消息展示",
-    "hint": "show_lyric 会附带前 30 行歌词；send_as_record=true 用语音组件发送（QQ/微信适配更好但不支持封面+歌词组合）",
+    "hint": "show_lyric 会附带前 30 行歌词。audio 模式走 Record 组件时，AstrBot 会把音频转成 base64 WAV 再上传，体积太大会发不出去 —— 超过 record_max_mb 会自动用 ffmpeg 压成 mp3",
     "items": {
       "opening_enabled": {
         "description": "发送开场语",
@@ -133,7 +133,7 @@
       },
       "output_mode": {
         "description": "消息输出方式",
-        "hint": "link=文本+封面+直链（最稳，文件大也能看，但用户需自己点链接）;audio=文本+封面+音频文件（推荐默认，下载后上传，QQ 兼容最好）;video=只发合成视频气泡（封面+音频合一，体验最好但容易踩 retcode=100 fetch failed）",
+        "hint": "link=文本+封面+直链（最稳，不下载）;audio=文本+封面+音频（推荐默认，超大文件自动转码）;video=只发合成视频气泡（封面+音频合一，需要 ffmpeg，视频会独占一条消息）",
         "type": "string",
         "options": [
           "link",
@@ -146,6 +146,30 @@
         "description": "附带专辑封面",
         "type": "bool",
         "default": true
+      },
+      "record_max_mb": {
+        "description": "语音发送体积上限（MB）",
+        "hint": "AstrBot 会把语音转成 base64 WAV 再上传（AstrBot 内部行为，换协议端也一样），超过这个体积就先用 ffmpeg 压成 mp3。8MB 是稳妥值；调大会更容易发不出去。",
+        "type": "int",
+        "default": 8
+      },
+      "record_bitrate_kbps": {
+        "description": "转码目标码率（kbps）",
+        "hint": "转 mp3 的码率上限，实际码率会按时长自动下调以塞进体积上限。48-320，默认 128。",
+        "type": "int",
+        "default": 128
+      },
+      "record_transcode": {
+        "description": "超大文件自动转码",
+        "hint": "关掉后超大文件直接降级为群文件附件/直链，不转码。",
+        "type": "bool",
+        "default": true
+      },
+      "send_timeout": {
+        "description": "发送超时（秒）",
+        "hint": "单次发送（含 base64 编码 + 上传）的超时保护。网络慢可以调大。",
+        "type": "int",
+        "default": 60
       },
       "video_fps": {
         "description": "视频帧数",

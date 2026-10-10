@@ -1,17 +1,42 @@
-"""astrbot_plugin_music_parser 主入口（v0.3.14 — 修复 Record API + 大 FLAC 超时）。
+"""astrbot_plugin_music_parser 主入口（v0.3.16 — 发送链路修复 + 性能）。
 
 进程内直接 import vendor 模块，零子进程。
 
-v0.3.13 修复 video 模式 retcode=100 'fetch failed'：
-- Video 节点改用裸绝对路径而不是 file:// URI
-- video 模式发送失败时自动降级到 audio 模式 (Plain+Image+Record)
-- 默认 output_mode 从 'video' 改为 'audio'，降低默认踩坑概率
+v0.3.16 性能修复（全部基于实测，见 README「性能」一节）：
+- **audio 模式不再白合成封面视频。** 以前只要 output_mode 不是 'link' 就合成，
+  但 audio 模式下 send_as_record=True，`_audio_component` 的 Video 分支要求
+  `not as_record`，那个 mp4 从头到尾没人用。实测 240s 无损 + 真实封面：
+  合成耗时 23.20s、产出 6MB mp4，最终音频组件却是 Record —— 纯浪费。
+  端到端实测 26.70s → 3.39s（−87%）。
+- 子进程调用（ffmpeg/ffprobe）全部挪出 event loop。对 async bot 来说被阻塞
+  = 期间对**所有**消息无响应，不只是当前这首。实测 probe_duration 同步调用
+  卡顿 0.116s → executor 版 0.001s。
+- video_synthesizer 复用 aiohttp session，不再每首歌重做一次 TCP+TLS 握手。
 
-v0.3.14 修复 Record API 改名 + 大 FLAC 30s 超时：
-- AstrBot 4.26.8 删除了 Record.fromFile, 必须用 Record.fromFileSystem
-- 本地文件 > 20MB 时跳过 Record, 直接走 File 组件 (Record 走 base64+wav
-  编码, 大文件 30s 超时; File 走 file:// raw multipart 上传, 大文件能过)
-- audio 模式 (as_record=True) fallback 用 File 而不是 Video, 用户期望的是音频
+v0.3.15 修的三个坑（都来自真实日志 / 协议端源码）：
+
+1. **大文件必炸（40MB FLAC → 56MB base64）**
+   AstrBot 的 aiocqhttp 适配器对 Record 组件无条件 `convert_to_base64()`，
+   而 `Record.convert_to_base64()` 内部走 `to_base64(target_format="wav")`
+   —— 先用 ffmpeg 把音频解码成 PCM WAV 再 base64。
+   40MB FLAC（约 4 分钟）→ 42MB WAV → 56MB base64 单个 WebSocket 帧。
+   修复：新增 core/audio_fitter.py，在交给 AstrBot **之前**压到 8MB 以内。
+   注意这跟协议端无关 —— 膨胀发生在 AstrBot 内部，还没走到 NapCat/SnowLuma。
+
+2. **Record.fromFile 已不存在**
+   AstrBot 4.26.8 移除了 `Record.fromFile`，老代码直接调它会抛
+   `AttributeError: type object 'Record' has no attribute 'fromFile'`。
+   修复：message_builder 改成能力探测（fromFileSystem → 构造器 → fromURL）。
+
+3. **retcode=1400: video 必须是唯一消息段**
+   SnowLuma 在 `assertVideoSendPolicy` 里显式拒绝 video 与其他段同发
+   （packages/protocol/src/element-manifest.ts）。老代码在 Record 失败时把
+   .flac 塞进 Video 节点，还和文本封面混在一条消息里，两个错叠一起。
+   修复：(a) 彻底禁用「音频文件包 Video」的 fallback；(b) 用
+   split_chain_for_send() 把 Video 拆成独立的 event.send()。
+
+v0.3.14 修复 Record API 改名 + 大 FLAC 30s 超时（已被 v0.3.15 覆盖并重写）。
+v0.3.13 修复 video 模式 retcode=100 'fetch failed'。
 """
 
 from __future__ import annotations
@@ -41,12 +66,14 @@ from .core.parser_manager import ParserManager
 
 logger = get_logger()
 
+PLUGIN_VERSION = "0.3.16"
+
 
 @register(
     "astrbot_plugin_music_parser",
     "uuutt2023",
     "开箱即用的网易云 / QQ 音乐解析插件（进程内调用，零子进程）",
-    "0.3.14",
+    PLUGIN_VERSION,
 )
 class MusicParserPlugin(Star):
 
@@ -61,11 +88,12 @@ class MusicParserPlugin(Star):
         self.download_manager: Optional[DownloadManager] = None
 
         i(
-            f"[init] === 音乐解析插件 v0.3.8 启动 === "
+            f"[init] === 音乐解析插件 v{PLUGIN_VERSION} 启动 === "
             f"verbose={cfg.debug.verbose_log}, "
             f"netease_cookie={'YES' if cfg.cookies.netease_cookie else 'NO'}, "
             f"tencent_cookie={'YES' if cfg.cookies.tencent_cookie else 'NO'}, "
             f"netease_mode={cfg.parsers.netease}, tencent_mode={cfg.parsers.tencent}, "
+            f"output_mode={cfg.message.output_mode}, "
             f"auto_parse={cfg.trigger.auto_parse}, reply_trigger={cfg.trigger.reply_trigger}"
         )
         self._init_runtime()
@@ -133,6 +161,13 @@ class MusicParserPlugin(Star):
             await self.download_manager.shutdown()
         if self._http and not self._http.closed:
             await self._http.close()
+        # v0.3.16：释放 video_synthesizer 的共享 HTTP session
+        try:
+            from .core.video_synthesizer import close_shared_session
+
+            await close_shared_session()
+        except Exception as exc:  # noqa: BLE001
+            w(f"[terminate] 关闭共享 session 失败: {exc}")
         i("[terminate] 已清理资源")
 
     # ─────────────── 消息分发核心 ───────────────
@@ -229,9 +264,10 @@ class MusicParserPlugin(Star):
     def _compute_output_config(self, meta) -> dict:
         """计算当前歌曲的输出配置 (output_mode / send_as_record / show_*)。
 
-        v0.3.11: 从 _send_one 拆出，便于独立测试和复用。
-        v0.3.13: 默认 output_mode 从 'video' 改成 'audio'，因为 video 模式
-                 在 aiocqhttp + napcat 链路下经常踩 retcode=100 'fetch failed'。
+        v0.3.15：output_mode 等字段现在由 ConfigManager 真正读进来了。
+        之前它们在 _conf_schema.json 里存在但 ConfigManager 没读，
+        `getattr(cfg.message, "output_mode", "audio")` 永远返回 "audio"，
+        用户在 WebUI 里选 video 被静默忽略。
         """
         cfg = self.config_manager
         show_text = cfg.parsers.has_text(meta.source)
@@ -240,7 +276,6 @@ class MusicParserPlugin(Star):
         show_lyric = show_text and bool(getattr(cfg.message, "show_lyric", False))
 
         # 归一化 output_mode (link / audio / video)
-        # v0.3.13: 默认值改 'audio' (更稳), 历史 v0.3.9-v0.3.12 用户配 'video' 时仍走 video
         mode = str(getattr(cfg.message, "output_mode", "audio") or "audio").lower().strip()
         if mode not in ("link", "audio", "video"):
             mode = "audio"
@@ -252,7 +287,9 @@ class MusicParserPlugin(Star):
         d(
             f"[send_one] 输出模式: text={show_text} audio={show_audio} "
             f"cover={show_cover} lyric={show_lyric} output_mode={mode} "
-            f"send_as_record={send_as_record}"
+            f"send_as_record={send_as_record} "
+            f"record_max_mb={getattr(cfg.message, 'record_max_mb', 8)} "
+            f"transcode={getattr(cfg.message, 'record_transcode', True)}"
         )
         return {
             "show_text": show_text,
@@ -292,14 +329,31 @@ class MusicParserPlugin(Star):
     async def _maybe_synth_video(
         self, meta, local_path: Optional[Path], cfg_out: dict
     ) -> Optional[Path]:
-        """合成 封面+音频 视频气泡 (output_mode in audio/video)。
+        """合成 封面+音频 视频气泡 —— **仅 video 模式需要**。
 
-        失败返回 None (调用方降级处理)。
+        v0.3.16 性能修复：以前只要 output_mode 不是 'link' 就合成，于是默认的
+        audio 模式也在合成。问题是 audio 模式下 send_as_record=True，
+        `_audio_component` 的 Video 分支要求 `not as_record`，根本不会去用这个
+        合成视频 —— 也就是说每首歌白白跑一次 ffmpeg。
+
+        实测（240s 无损 + 真实封面图）：合成耗时 23.20s、产出 6MB mp4，
+        最终音频组件用的却是 Record/File，那 23 秒和 6MB 磁盘全是纯浪费。
+        bot 表现为"发一首歌要等二十多秒"。
+
+        现在只有 output_mode == 'video' 才合成。失败返回 None（调用方降级）。
+
+        注意：video 模式本身要求 ffmpeg + 封面可用，所以这条路天然只在
+        "确实要用视频"时才付这个成本。
         """
         cfg = self.config_manager
-        if not (local_path and local_path.exists() and meta.pic_url):
+        if cfg_out["output_mode"] != "video":
+            # audio 模式用不到合成视频；link 模式连音频都不发
+            d(
+                f"[send_one] output_mode={cfg_out['output_mode']}，"
+                f"跳过封面视频合成（audio/link 模式不会用到 Video 节点）"
+            )
             return None
-        if cfg_out["output_mode"] == "link":
+        if not (local_path and Path(local_path).exists() and meta.pic_url):
             return None
         try:
             from .core.video_synthesizer import synthesize_to_temp
@@ -344,29 +398,48 @@ class MusicParserPlugin(Star):
         return chain
 
     async def _send_chain(self, event, chain: list, meta) -> tuple[bool, str]:
-        """发送消息链，加超时保护。返回 (是否成功, 失败原因)。
+        """发送消息链（Video 拆条），返回 (是否成功, 失败原因)。
 
-        v0.3.14: 默认超时从 30s 改为 60s，给大文件 (30MB+ FLAC) 留上传时间。
-        v0.3.13：失败原因用于上层判断是否要降级 (例如 video 模式 retcode=100
-        fetch failed → 降级到 audio 模式重发)。
+        v0.3.15：不再整条链一次 event.send()。Video 节点会被拆成独立的一条
+        消息 —— SnowLuma 的 assertVideoSendPolicy 明确要求
+        'message element "video" must be the only segment in a message'
+        （QQ 客户端把视频当独立消息，同级元素留在链上但不渲染）。
+
+        超时按 message.send_timeout 配置（默认 60s），可配。
         """
-        try:
-            await asyncio.wait_for(
-                event.send(event.chain_result(chain)),
-                timeout=60.0,
+        from .utils.message_builder import split_chain_for_send
+
+        groups = split_chain_for_send(chain)
+        timeout = float(getattr(self.config_manager.message, "send_timeout", 60) or 60)
+        if len(groups) > 1:
+            i(
+                f"[send_one] 消息链含 Video，拆成 {len(groups)} 条分别发送 "
+                f"(共 {len(chain)} 段)"
             )
-            i(f"[send_one] 已发送: {meta.name!r}")
-            return True, ""
-        except asyncio.TimeoutError:
-            reason = "timeout(60s)"
-            e(
-                f"[send_one] 发送超时（60s）: {meta.name!r} "
-                f"chain_len={len(chain)} 可能因为音频文件过大导致 aiocqhttp 上传失败"
-            )
-        except Exception as exc:  # noqa: BLE001
-            reason = f"{type(exc).__name__}: {exc}"
-            e(f"[send_one] 发送失败: {exc}\n{traceback.format_exc()}")
-        return False, reason
+
+        for idx, group in enumerate(groups, 1):
+            try:
+                await asyncio.wait_for(
+                    event.send(event.chain_result(group)),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                reason = f"timeout({timeout:.0f}s)"
+                e(
+                    f"[send_one] 发送超时（{timeout:.0f}s）: {meta.name!r} "
+                    f"第 {idx}/{len(groups)} 组, group_len={len(group)}"
+                )
+                return False, reason
+            except Exception as exc:  # noqa: BLE001
+                reason = f"{type(exc).__name__}: {exc}"
+                e(
+                    f"[send_one] 发送失败（第 {idx}/{len(groups)} 组）: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                return False, reason
+
+        i(f"[send_one] 已发送: {meta.name!r} ({len(groups)} 条消息)")
+        return True, ""
 
     async def _send_fallback_audio_mode(
         self, event, meta, local_path, cfg_out: dict, reason: str
@@ -410,30 +483,84 @@ class MusicParserPlugin(Star):
             e(f"[send_one] 降级到 audio 模式也失败: {type(exc).__name__}: {exc}")
             return False
 
-    async def _send_fallback_plain(self, event, meta, local_path) -> None:
-        """最后兜底：发一条 Plain 文本（直链 + 错误说明）。"""
+    async def _send_fallback_plain(
+        self, event, meta, local_path, fit_note: str = ""
+    ) -> None:
+        """最后兜底：发一条 Plain 文本（直链 + 说明为什么没能直接发音频）。"""
         if not meta.audio_url:
             return
         try:
             size_mb = (local_path.stat().st_size // 1024 // 1024) if local_path else 0
+            reason = fit_note or "未知原因"
             fallback_text = (
-                f"⚠️ 音频上传失败（文件 {size_mb}MB 超限 / 网络超时）\n"
-                f"🔗 音频直链：{meta.audio_url}"
+                f"⚠️ 音频没能直接发出来（{reason}）\n"
+                f"🔗 音频直链：{meta.audio_url}\n"
+                f"💡 原始文件 {size_mb}MB，AstrBot 会把语音转成 base64 WAV 再上传，"
+                f"体积太大会发不出去；把 message.record_max_mb 调小或改用 video 模式试试"
             )
             await event.send(event.plain_result(fallback_text))
             i(f"[send_one] 兜底发送 Plain 链接成功: {meta.name!r}")
         except Exception as exc:  # noqa: BLE001
             e(f"[send_one] 兜底发送也失败: {exc}")
 
-    def _schedule_cleanup(self, local_path, synth_video_path) -> None:
-        """清理音频缓存和合成视频。"""
+    def _schedule_cleanup(self, local_path, synth_video_path, fitted_path=None) -> None:
+        """清理音频缓存、转码产物和合成视频。
+
+        转码产物跟源文件用同一个延时清理窗口：这样同一首歌在窗口内被再次请求时，
+        audio_fitter 的缓存还能命中，不用重跑一遍 ffmpeg。
+        """
         if local_path and self.download_manager:
             self.download_manager.schedule_cleanup(local_path)
         if synth_video_path and self.download_manager:
             self.download_manager.schedule_cleanup(synth_video_path)
+        if fitted_path and Path(fitted_path) != Path(local_path or ""):
+            if self.download_manager:
+                self.download_manager.schedule_cleanup(Path(fitted_path))
+            else:
+                from .core.audio_fitter import cleanup_transcode
+
+                cleanup_transcode(local_path, fitted_path)
+
+    async def _fit_audio(self, meta, local_path, cfg_out: dict) -> tuple[Optional[Path], str]:
+        """v0.3.15：在交给 AstrBot 之前把音频压到能安全 base64 的体积。
+
+        只在 audio 模式（会走 Record 组件）下需要 —— Record 会被转成 base64
+        WAV，体积直接决定这条消息会不会把 WebSocket 单帧撑爆。
+        link 模式根本不下载，video 模式走的是 mp4 文件上传，都不需要压。
+
+        返回 (实际要发的路径, 说明)。
+
+        注意：压不下来时返回的是**原路径而不是 None**。返回 None 等于告诉
+        下游「没有本地文件」，于是 build_song_chain 会退到 Record.fromURL ——
+        而那个 URL 指向的就是同一个超大文件，等于白绕一圈还是炸。正确做法是
+        把原路径传下去，让 message_builder 按体积判定降级成 File 附件。
+        """
+        from .core.audio_fitter import fit_audio_for_record
+
+        cfg = self.config_manager
+        if not (local_path and Path(local_path).exists()):
+            return None, "无本地文件"
+        if cfg_out["output_mode"] != "audio" or not cfg_out["send_as_record"]:
+            return local_path, "无需转码"
+
+        msg = cfg.message
+        fitted, note = await fit_audio_for_record(
+            Path(local_path),
+            max_mb=msg.record_max_mb,
+            cap_bitrate_kbps=msg.record_bitrate_kbps,
+            enabled=msg.record_transcode,
+        )
+        if fitted is None:
+            w(
+                f"[send_one] 音频压不下去（{note}），"
+                f"把原文件交给下游按体积降级处理"
+            )
+            return local_path, note
+        d(f"[send_one] 音频体积治理: {note}")
+        return fitted, note
 
     async def _send_one(self, event: AstrMessageEvent, meta):
-        """编排发送流程：输出配置 → 下载 → 合成 → 组装 → 发送 → 补救 → 清理。"""
+        """编排发送流程：输出配置 → 下载 → 压体积 → 合成 → 组装 → 发送 → 补救 → 清理。"""
         cfg = self.config_manager
         d(
             f"[send_one] source={meta.source} ok={meta.ok} "
@@ -466,31 +593,31 @@ class MusicParserPlugin(Star):
                 f"cache={cfg.cache.enable_cache})"
             )
 
-        # 3) 合成封面视频
+        # 3) 体积治理：Record 会被转 base64 WAV，大文件必须先压
+        send_path, fit_note = await self._fit_audio(meta, local_path, cfg_out)
+
+        # 4) 合成封面视频
         synth_video_path = await self._maybe_synth_video(meta, local_path, cfg_out)
 
-        # 4) 组装消息
-        chain = self._build_chain(meta, local_path, synth_video_path, cfg_out)
+        # 5) 组装消息
+        chain = self._build_chain(meta, send_path, synth_video_path, cfg_out)
 
-        # 5) 发送
+        # 6) 发送
         send_ok, fail_reason = await self._send_chain(event, chain, meta)
 
-        # 6) 补救（发送失败时）
-        # v0.3.13: video 模式失败时优先降级到 audio 模式 (Plain+Image+Record)
-        # 而不是直接发 Plain 链接, 让用户至少能听到音频
+        # 7) 补救（发送失败时）
+        #    video 模式失败 → 优先降级 audio；再失败 → 发直链兜底
         if not send_ok and cfg_out["show_audio"]:
-            # 6.1 优先尝试 audio 模式降级 (仅在原模式是 video 时)
             degraded_ok = False
-            if cfg_out["output_mode"] == "video" and local_path and local_path.exists():
+            if cfg_out["output_mode"] == "video" and send_path and Path(send_path).exists():
                 degraded_ok = await self._send_fallback_audio_mode(
-                    event, meta, local_path, cfg_out, fail_reason
+                    event, meta, send_path, cfg_out, fail_reason
                 )
-            # 6.2 仍失败, 发 Plain 链接兜底
             if not degraded_ok:
-                await self._send_fallback_plain(event, meta, local_path)
+                await self._send_fallback_plain(event, meta, local_path, fit_note)
 
-        # 7) 清理缓存
-        self._schedule_cleanup(local_path, synth_video_path)
+        # 8) 清理缓存
+        self._schedule_cleanup(local_path, synth_video_path, send_path)
 
     # ─────────────── 强制指定平台的命令 (v0.3.11: 加 / 前缀别名) ───────────────
 
@@ -653,7 +780,7 @@ class MusicParserPlugin(Star):
             "仅音频": "🎵",
         }.get(cfg.parsers.tencent, cfg.parsers.tencent)
         lines = [
-            "🎵 音乐解析状态 (v0.3.11)",
+            f"🎵 音乐解析状态 (v{PLUGIN_VERSION})",
             "",
             "📦 后端健康：",
             f"  网易云：{'✅' if health.get('netease') else '⚠️'} "
@@ -666,7 +793,9 @@ class MusicParserPlugin(Star):
             f"  QQ 音乐模式：{te_mode_emoji} {cfg.parsers.tencent}",
             f"  网易云音质：{cfg.quality.netease_level}",
             f"  QQ 音质：{cfg.quality.tencent_level}",
-            f"  输出模式：{getattr(cfg.message, 'output_mode', 'video')}",
+            f"  输出模式：{cfg.message.output_mode}",
+            f"  语音体积上限：{cfg.message.record_max_mb}MB"
+            f"（超大自动转 mp3：{'开' if cfg.message.record_transcode else '关'}）",
             f"  自动解析：{'开' if cfg.trigger.auto_parse else '关'}",
             f"  本地缓存：{'开' if cfg.cache.enable_cache else '关'}",
             f"  详细日志：{'开' if cfg.debug.verbose_log else '关'}",
@@ -765,7 +894,7 @@ class MusicParserPlugin(Star):
     @staticmethod
     def _help_text() -> str:
         return (
-            "🎵 音乐解析插件 帮助（v0.3.11）\n"
+            f"🎵 音乐解析插件 帮助（v{PLUGIN_VERSION}）\n"
             "\n"
             "✨ 首次使用：\n"
             "  AstrBot WebUI → 音乐解析插件 → 配置 → 填入\n"
@@ -775,8 +904,14 @@ class MusicParserPlugin(Star):
             "\n"
             "🎬 三种输出方式（message.output_mode）：\n"
             "  • link  - 文本 + 封面 + 音频直链（不下载，最稳）\n"
-            "  • audio - 文本 + 封面 + 音频文件（QQ 收件）\n"
-            "  • video - 只发合成视频气泡（封面循环 + 音频，默认）\n"
+            "  • audio - 文本 + 封面 + 音频文件（默认；超大文件自动压成 mp3）\n"
+            "  • video - 只发合成视频气泡（封面循环 + 音频，需要 ffmpeg）\n"
+            "\n"
+            "🔉 大文件发不出去？\n"
+            "  AstrBot 会把语音转成 base64 WAV 再上传（这是 AstrBot 内部行为，\n"
+            "  换协议端也一样），所以无损 FLAC 这类大文件必然发不出去。\n"
+            "  本插件默认在发送前用 ffmpeg 压到 message.record_max_mb（8MB）以内。\n"
+            "  没装 ffmpeg 的话，可以把 record_max_mb 调小，或改用 link 模式。\n"
             "\n"
             "🎮 命令（都支持加 / 前缀，如 /网易云）：\n"
             "  • 网易云 <链接/ID>    强制走网易云解析\n"
@@ -791,5 +926,5 @@ class MusicParserPlugin(Star):
             "  1) WebUI 把 debug.verbose_log 设为 true\n"
             "  2) 复现问题\n"
             "  3) 把 AstrBot 控制台里 [music_parser] 开头的日志贴出来\n"
-            "     特别关注 [on_message] [parse] [send_one] [extract_*]\n"
+            "     特别关注 [audio_fit] [chain._audio] [send_one] [video_synth]\n"
         )
